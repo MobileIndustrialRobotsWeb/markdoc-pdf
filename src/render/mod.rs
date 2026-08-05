@@ -251,11 +251,6 @@ pub fn render_pdf_with(
         .clone()
         .unwrap_or_else(crate::dates::today_yyyy_mm_dd);
     let mut blocks = blocks;
-    // Number of leading pages the cover occupies (0 when disabled). The
-    // cover emits one `PageBreak` per page it produces (plus an optional
-    // blank verso), so counting them gives the page count without a
-    // separate pagination pass. Used to keep the cover ahead of any
-    // start-positioned ToC / LoF / LoT.
     let mut cover_page_count = 0usize;
     if style.coverpage.enabled {
         let mut fp = coverpage::build_coverpage_blocks(
@@ -288,9 +283,6 @@ pub fn render_pdf_with(
         .as_ref()
         .map(|f| f.reserved_height())
         .unwrap_or(0.0);
-    // Optional notice banner — a tall masthead at the top of every page.
-    // It starts at `banner_band_top` and its `height` plus a gap pushes
-    // the body down; reserve the extra space beyond the normal top margin.
     let banner_band_top = style.margin_y * 0.42;
     let banner_reserved = style
         .page_decoration
@@ -307,11 +299,6 @@ pub fn render_pdf_with(
     let inner_x = style.margin_x;
     let inner_w = style.page_width - 2.0 * style.margin_x;
 
-    // The cover page (page 0) may carry its own vertical margin
-    // (`CoverPageStyle::margin_y`) so a tall hero can bleed toward the page
-    // edges. When set, the first page gets its own budget and start; since it
-    // skips its header / footer, its whole height between the cover margins is
-    // available. (Its horizontal margin is baked into the cover blocks' x.)
     let cover_first_page = style.coverpage.enabled
         && (style.coverpage.margin_x.is_some() || style.coverpage.margin_y.is_some());
     let cover_margin_y = style.coverpage.margin_y.unwrap_or(style.margin_y);
@@ -336,12 +323,28 @@ pub fn render_pdf_with(
         body_start_y
     };
 
+    let column_layout = if style.page_layout.columns > 1 {
+        Some(emit::PageColumnLayout {
+            columns: style.page_layout.columns,
+            column_width: (inner_w - style.page_layout.gap * (style.page_layout.columns as f32 - 1.0))
+                / style.page_layout.columns as f32,
+            gap: style.page_layout.gap,
+        })
+    } else {
+        None
+    };
+
     // Footnote-aware pagination: pool height is recomputed every time
     // a block carrying footnote calls is added, so the body budget
     // shrinks dynamically as footnotes accumulate.
     let body_with_pools: Vec<(Vec<block::Block>, Vec<block::Block>)> = {
         let footnotes = &footnotes;
-        paginate::paginate_with_footnotes(blocks, page_budget, first_page_budget, |numbers| {
+        paginate::paginate_with_footnotes(
+            blocks,
+            page_budget,
+            first_page_budget,
+            style.page_layout.columns,
+            |numbers| {
             if numbers.is_empty() {
                 return (0.0, Vec::new());
             }
@@ -427,7 +430,7 @@ pub fn render_pdf_with(
     // emit to resolve `{% tagref %}` internal links (`href = "#id"`)
     // to PDF GoTo destinations. We can't defer this until after the
     // emit loop because annotations must be added before page.finish().
-    let anchor_map = collect_anchor_map(&pages, body_start_y);
+    let anchor_map = collect_anchor_map(&pages, body_start_y, column_layout);
 
     let mut document = build_document(style.pdf_export);
     apply_metadata(&mut document, ctx);
@@ -487,6 +490,7 @@ pub fn render_pdf_with(
                 &mut links,
                 &mut outline_pts,
                 &mut page_tags,
+                column_layout,
             );
 
             // Footnote pool: floats at the bottom of the printable
@@ -504,6 +508,7 @@ pub fn render_pdf_with(
                     &mut links,
                     &mut outline_pts,
                     &mut page_tags,
+                    None,
                 );
             }
 
@@ -725,10 +730,11 @@ fn document_has_no_pages(_doc: &Document) -> bool {
 fn collect_anchor_map(
     pages: &[(Vec<block::Block>, Vec<block::Block>)],
     body_start_y: f32,
+    columns: Option<emit::PageColumnLayout>,
 ) -> std::collections::HashMap<String, (usize, f32)> {
     let mut map = std::collections::HashMap::new();
     for (page_idx, (page_blocks, _pool)) in pages.iter().enumerate() {
-        walk_anchors(page_blocks, page_idx, body_start_y, &mut map);
+        walk_anchors(page_blocks, page_idx, body_start_y, columns, &mut map);
     }
     map
 }
@@ -737,75 +743,108 @@ fn walk_anchors(
     blocks: &[block::Block],
     page_idx: usize,
     start_y: f32,
+    columns: Option<emit::PageColumnLayout>,
+    map: &mut std::collections::HashMap<String, (usize, f32)>,
+) {
+    if columns.map(|c| c.columns).unwrap_or(1) <= 1 {
+        walk_anchors_single(blocks, page_idx, start_y, map);
+        return;
+    }
+    let layout = columns.unwrap();
+    let n = layout.columns.max(1) as usize;
+    let mut col_y = vec![start_y; n];
+    for block in blocks {
+        let col_idx = block.page_column.min(layout.columns.saturating_sub(1)) as usize;
+        let y = if block.column_span {
+            col_y.iter().copied().fold(start_y, f32::max)
+        } else {
+            col_y[col_idx]
+        };
+        record_block_anchors(block, page_idx, y, map);
+        let advance = block.height + block.space_after;
+        if block.column_span {
+            let new_y = y + advance;
+            for cy in &mut col_y {
+                *cy = new_y;
+            }
+        } else {
+            col_y[col_idx] = y + advance;
+        }
+    }
+}
+
+fn walk_anchors_single(
+    blocks: &[block::Block],
+    page_idx: usize,
+    start_y: f32,
     map: &mut std::collections::HashMap<String, (usize, f32)>,
 ) {
     let mut y = start_y;
     for block in blocks {
-        if let Some(id) = &block.anchor_id {
-            map.entry(id.clone()).or_insert((page_idx, y));
-        }
-        match &block.draw {
-            block::BlockDraw::Text(slice)
-                // Mid-paragraph anchors. For each declared (byte_offset, id),
-                // find the line containing the byte and compute its y
-                // relative to the slice's drawn top (this block's `y`).
-                if !slice.mid_anchors.is_empty() => {
-                    for anchor in slice.mid_anchors.iter() {
-                        if let Some(line_y_offset) =
-                            mid_anchor_y_in_slice(slice, anchor.byte_offset)
-                        {
-                            map.entry(anchor.id.clone())
-                                .or_insert((page_idx, y + line_y_offset));
-                        }
-                    }
-                }
-            block::BlockDraw::BoxedGroup {
-                children, padding, ..
-            } => {
-                walk_anchors(children, page_idx, y + *padding, map);
-            }
-            block::BlockDraw::ListItem { body, .. } => {
-                walk_anchors(body, page_idx, y, map);
-            }
-            block::BlockDraw::Table {
-                rows,
-                cell_padding,
-                border_thickness,
-                ..
-            } => {
-                let mut row_top = y + *border_thickness;
-                for row in rows {
-                    for cell in &row.cells {
-                        walk_anchors(&cell.blocks, page_idx, row_top + *cell_padding, map);
-                    }
-                    row_top += row.height + *border_thickness;
-                }
-            }
-            block::BlockDraw::Float { image, wrap } => {
-                // Image and wrap both stack from the float's top; the wrap
-                // slice advances y internally per block, matching emit.
-                walk_anchors(std::slice::from_ref(image.as_ref()), page_idx, y, map);
-                walk_anchors(wrap, page_idx, y, map);
-            }
-            block::BlockDraw::FloatRegion { text, floats } => {
-                // Mid-paragraph anchors resolve within the prose slice; each
-                // floated image resolves at its own offset below the top.
-                for anchor in text.mid_anchors.iter() {
-                    if let Some(dy) = mid_anchor_y_in_slice(text, anchor.byte_offset) {
-                        map.entry(anchor.id.clone())
-                            .or_insert((page_idx, y + dy));
-                    }
-                }
-                for fl in floats {
-                    if let Some(id) = &fl.image.anchor_id {
-                        map.entry(id.clone())
-                            .or_insert((page_idx, y + fl.y_offset));
-                    }
-                }
-            }
-            _ => {}
-        }
+        record_block_anchors(block, page_idx, y, map);
         y += block.height + block.space_after;
+    }
+}
+
+fn record_block_anchors(
+    block: &block::Block,
+    page_idx: usize,
+    y: f32,
+    map: &mut std::collections::HashMap<String, (usize, f32)>,
+) {
+    if let Some(id) = &block.anchor_id {
+        map.entry(id.clone()).or_insert((page_idx, y));
+    }
+    match &block.draw {
+        block::BlockDraw::Text(slice) if !slice.mid_anchors.is_empty() => {
+            for anchor in slice.mid_anchors.iter() {
+                if let Some(line_y_offset) = mid_anchor_y_in_slice(slice, anchor.byte_offset) {
+                    map.entry(anchor.id.clone())
+                        .or_insert((page_idx, y + line_y_offset));
+                }
+            }
+        }
+        block::BlockDraw::BoxedGroup {
+            children, padding, ..
+        } => {
+            walk_anchors_single(children, page_idx, y + *padding, map);
+        }
+        block::BlockDraw::ListItem { body, .. } => {
+            walk_anchors_single(body, page_idx, y, map);
+        }
+        block::BlockDraw::Table {
+            rows,
+            cell_padding,
+            border_thickness,
+            ..
+        } => {
+            let mut row_top = y + *border_thickness;
+            for row in rows {
+                for cell in &row.cells {
+                    walk_anchors_single(&cell.blocks, page_idx, row_top + *cell_padding, map);
+                }
+                row_top += row.height + *border_thickness;
+            }
+        }
+        block::BlockDraw::Float { image, wrap } => {
+            walk_anchors_single(std::slice::from_ref(image.as_ref()), page_idx, y, map);
+            walk_anchors_single(wrap, page_idx, y, map);
+        }
+        block::BlockDraw::FloatRegion { text, floats } => {
+            for anchor in text.mid_anchors.iter() {
+                if let Some(dy) = mid_anchor_y_in_slice(text, anchor.byte_offset) {
+                    map.entry(anchor.id.clone())
+                        .or_insert((page_idx, y + dy));
+                }
+            }
+            for fl in floats {
+                if let Some(id) = &fl.image.anchor_id {
+                    map.entry(id.clone())
+                        .or_insert((page_idx, y + fl.y_offset));
+                }
+            }
+        }
+        _ => {}
     }
 }
 

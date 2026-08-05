@@ -229,6 +229,8 @@ pub fn build_coverpage_blocks(
         outline: None,
         anchor_id: None,
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     });
 
     // Optional blank verso — for double-sided printing the body
@@ -246,6 +248,8 @@ pub fn build_coverpage_blocks(
             outline: None,
             anchor_id: None,
             tag_role: None,
+            page_column: 0,
+            column_span: false,
         });
     }
 
@@ -307,6 +311,8 @@ fn spacer_block(x: f32, height: f32) -> Block {
         outline: None,
         anchor_id: None,
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }
 }
 
@@ -372,6 +378,8 @@ fn cover_title_block(
         outline: None,
         anchor_id: None,
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }
 }
 
@@ -407,6 +415,8 @@ fn cover_text_block(
         outline: None,
         anchor_id: None,
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }
 }
 
@@ -425,12 +435,7 @@ fn build_logo_block(
     }
     let bytes = assets.fetch(&logo.src).ok()?;
     let format = sniff_format(&bytes);
-    // Match the cover's text alignment: flush-left for a left title page,
-    // centred otherwise.
-    let x = match align {
-        CoverAlign::Left => body_left,
-        CoverAlign::Center => body_left + (column_w - logo.width).max(0.0) * 0.5,
-    };
+    let x = cover_image_x(body_left, column_w, logo.width, align);
     let block = match format {
         MediaFormat::Png | MediaFormat::Jpeg | MediaFormat::Gif | MediaFormat::Webp => {
             let image = match format {
@@ -453,6 +458,8 @@ fn build_logo_block(
                 outline: None,
                 anchor_id: None,
                 tag_role: None,
+                page_column: 0,
+                column_span: false,
             }
         }
         MediaFormat::Svg => {
@@ -471,9 +478,18 @@ fn build_logo_block(
                 outline: None,
                 anchor_id: None,
                 tag_role: None,
+                page_column: 0,
+                column_span: false,
             }
         }
         _ => return None,
     };
     Some(block)
+}
+
+fn cover_image_x(body_left: f32, column_w: f32, width: f32, align: CoverAlign) -> f32 {
+    match align {
+        CoverAlign::Left => body_left,
+        CoverAlign::Center => body_left + (column_w - width).max(0.0) * 0.5,
+    }
 }

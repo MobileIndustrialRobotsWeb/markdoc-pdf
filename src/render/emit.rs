@@ -19,6 +19,24 @@ use super::inline::LinkRange;
 use super::style::TableBorders;
 use super::text::{emit_layout, emit_layout_segmented};
 
+/// Multi-column body layout parameters for the emit pass.
+#[derive(Debug, Clone, Copy)]
+pub struct PageColumnLayout {
+    pub columns: u8,
+    pub column_width: f32,
+    pub gap: f32,
+}
+
+impl PageColumnLayout {
+    pub fn x_offset_for(&self, block: &Block) -> f32 {
+        if self.columns <= 1 || block.column_span {
+            0.0
+        } else {
+            block.page_column as f32 * (self.column_width + self.gap)
+        }
+    }
+}
+
 /// `(x, y, width, height)` for one line of a link's bounding region,
 /// in page-local coordinates with y growing downward.
 pub type LineRect = (f32, f32, f32, f32);
@@ -110,7 +128,7 @@ impl TagAccumulator {
 
 /// Draw `blocks` starting at top y = `start_y`. Any link annotations
 /// produced by Text blocks are appended to `links`. Returns the bottom
-/// y after all blocks have been drawn.
+/// y after all blocks have been drawn (max column bottom when multi-column).
 pub fn emit_blocks(
     surface: &mut krilla::surface::Surface<'_>,
     blocks: &[Block],
@@ -119,6 +137,34 @@ pub fn emit_blocks(
     links: &mut Vec<DeferredLink>,
     outline: &mut Vec<OutlinePoint>,
     tags: &mut TagAccumulator,
+    columns: Option<PageColumnLayout>,
+) -> f32 {
+    if columns.map(|c| c.columns).unwrap_or(1) <= 1 {
+        return emit_blocks_single(
+            surface, blocks, start_y, font_cache, links, outline, tags, 0.0,
+        );
+    }
+    emit_blocks_multi(
+        surface,
+        blocks,
+        start_y,
+        font_cache,
+        links,
+        outline,
+        tags,
+        columns.unwrap(),
+    )
+}
+
+fn emit_blocks_single(
+    surface: &mut krilla::surface::Surface<'_>,
+    blocks: &[Block],
+    start_y: f32,
+    font_cache: &mut HashMap<u64, Font>,
+    links: &mut Vec<DeferredLink>,
+    outline: &mut Vec<OutlinePoint>,
+    tags: &mut TagAccumulator,
+    x_offset: f32,
 ) -> f32 {
     use krilla::tagging::ListNumbering;
     let mut y = start_y;
@@ -147,7 +193,16 @@ pub fn emit_blocks(
             {
                 let block = &blocks[i];
                 tags.enter(TagGroup::new(TagKind::LI(Tag::<kind::LI>::LI)));
-                emit_block(surface, block, y, font_cache, links, outline, tags);
+                emit_block(
+                    surface,
+                    block,
+                    y,
+                    x_offset,
+                    font_cache,
+                    links,
+                    outline,
+                    tags,
+                );
                 tags.leave(); // LI
                 y += block.height + block.space_after;
                 i += 1;
@@ -164,14 +219,140 @@ pub fn emit_blocks(
                 y,
             });
         }
-        emit_block(surface, block, y, font_cache, links, outline, tags);
+        emit_block(
+            surface,
+            block,
+            y,
+            x_offset,
+            font_cache,
+            links,
+            outline,
+            tags,
+        );
         y += block.height + block.space_after;
         i += 1;
     }
     y
 }
 
+fn emit_blocks_multi(
+    surface: &mut krilla::surface::Surface<'_>,
+    blocks: &[Block],
+    start_y: f32,
+    font_cache: &mut HashMap<u64, Font>,
+    links: &mut Vec<DeferredLink>,
+    outline: &mut Vec<OutlinePoint>,
+    tags: &mut TagAccumulator,
+    layout: PageColumnLayout,
+) -> f32 {
+    use krilla::tagging::ListNumbering;
+    let n = layout.columns.max(1) as usize;
+    let mut col_y = vec![start_y; n];
+    let mut i = 0;
+    while i < blocks.len() {
+        let block = &blocks[i];
+        let col_idx = block.page_column.min(layout.columns.saturating_sub(1)) as usize;
+        let y = if block.column_span {
+            col_y.iter().copied().fold(start_y, f32::max)
+        } else {
+            col_y[col_idx]
+        };
+        let x_offset = layout.x_offset_for(block);
+
+        let head_ordered = match &block.draw {
+            BlockDraw::ListItem { ordered, .. } if tags.enabled => Some(*ordered),
+            _ => None,
+        };
+        if let Some(head_ordered) = head_ordered {
+            let numbering = if head_ordered {
+                ListNumbering::Decimal
+            } else {
+                ListNumbering::Disc
+            };
+            tags.enter(TagGroup::new(TagKind::L(Tag::<kind::L>::L(numbering))));
+            let start_col = block.page_column;
+            while i < blocks.len()
+                && matches!(
+                    &blocks[i].draw,
+                    BlockDraw::ListItem { ordered, .. } if *ordered == head_ordered
+                )
+                && blocks[i].page_column == start_col
+            {
+                let block = &blocks[i];
+                let col_idx =
+                    block.page_column.min(layout.columns.saturating_sub(1)) as usize;
+                let y = col_y[col_idx];
+                let x_offset = layout.x_offset_for(block);
+                tags.enter(TagGroup::new(TagKind::LI(Tag::<kind::LI>::LI)));
+                emit_block(
+                    surface,
+                    block,
+                    y,
+                    x_offset,
+                    font_cache,
+                    links,
+                    outline,
+                    tags,
+                );
+                tags.leave();
+                col_y[col_idx] += block.height + block.space_after;
+                i += 1;
+            }
+            tags.leave();
+            continue;
+        }
+
+        if let Some(entry) = &block.outline {
+            outline.push(OutlinePoint {
+                level: entry.level,
+                text: entry.text.clone(),
+                y,
+            });
+        }
+        emit_block(
+            surface,
+            block,
+            y,
+            x_offset,
+            font_cache,
+            links,
+            outline,
+            tags,
+        );
+        let advance = block.height + block.space_after;
+        if block.column_span {
+            let new_y = y + advance;
+            for cy in &mut col_y {
+                *cy = new_y;
+            }
+        } else {
+            col_y[col_idx] = y + advance;
+        }
+        i += 1;
+    }
+    col_y.into_iter().fold(start_y, f32::max)
+}
+
 fn emit_block(
+    surface: &mut krilla::surface::Surface<'_>,
+    block: &Block,
+    y: f32,
+    x_offset: f32,
+    font_cache: &mut HashMap<u64, Font>,
+    links: &mut Vec<DeferredLink>,
+    outline: &mut Vec<OutlinePoint>,
+    tags: &mut TagAccumulator,
+) {
+    if x_offset != 0.0 {
+        surface.push_transform(&Transform::from_translate(x_offset, 0.0));
+    }
+    emit_block_inner(surface, block, y, font_cache, links, outline, tags);
+    if x_offset != 0.0 {
+        surface.pop();
+    }
+}
+
+fn emit_block_inner(
     surface: &mut krilla::surface::Surface<'_>,
     block: &Block,
     y: f32,
@@ -415,6 +596,7 @@ fn emit_block(
                 links,
                 outline,
                 tags,
+                None,
             );
         }
 
@@ -483,7 +665,7 @@ fn emit_block(
             }
             // Body content of the list item — wrap in LBody for PDF/UA.
             tags.enter(TagGroup::new(TagKind::LBody(Tag::<kind::LBody>::LBody)));
-            emit_blocks(surface, body, y, font_cache, links, outline, tags);
+            emit_blocks(surface, body, y, font_cache, links, outline, tags, None);
             tags.leave(); // LBody
         }
 
@@ -578,6 +760,7 @@ fn emit_block(
                         links,
                         outline,
                         tags,
+                        None,
                     );
                     tags.leave(); // TH/TD
                 }
@@ -707,8 +890,8 @@ fn emit_block(
             // column once clear), and `emit_blocks` advances y by the same
             // cumulative heights the layout pass used — so image and wrap
             // overlap exactly as intended.
-            emit_block(surface, image, y, font_cache, links, outline, tags);
-            emit_blocks(surface, wrap, y, font_cache, links, outline, tags);
+            emit_block(surface, image, y, 0.0, font_cache, links, outline, tags);
+            emit_blocks(surface, wrap, y, font_cache, links, outline, tags, None);
         }
 
         BlockDraw::FloatRegion { text, floats } => {
@@ -722,6 +905,7 @@ fn emit_block(
                     surface,
                     &fl.image,
                     y + fl.y_offset,
+                    0.0,
                     font_cache,
                     links,
                     outline,
