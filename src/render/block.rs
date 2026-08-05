@@ -1254,6 +1254,9 @@ fn layout_node(
         // `{% swatch %}` — a block colour bar / chip (solid or gradient).
         "swatch" => layout_swatch(tag, x, width, ctx),
 
+        // `{% lightindicators /%}` — status-light legend (swatch grid).
+        "lightindicators" => layout_lightindicators(x, width, ctx),
+
         // `{% qr %}` — a QR code from `value`.
         "qr" => layout_qr(tag, x, width, ctx),
 
@@ -3470,6 +3473,222 @@ fn layout_swatch(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<
             placeholder(x, width, ctx, "[swatch: render failed]")
         }
     }
+}
+
+/// One status-light entry — mirrors `components/LightIndicators.tsx` and
+/// the `.light-indicator-bar.*` fills in `public/globals.css`.
+struct LightIndicatorSpec {
+    title: &'static str,
+    description: &'static str,
+    /// Solid CSS colour, or `None` when `gradient` is set.
+    color: Option<&'static str>,
+    /// Swatch `gradient="…"` string (CSS-compatible stops), or `None`.
+    gradient: Option<&'static str>,
+}
+
+/// Status lights shown by `{% lightindicators /%}`. Colours / gradients
+/// match the web component's CSS classes.
+const LIGHT_INDICATORS: &[LightIndicatorSpec] = &[
+    LightIndicatorSpec {
+        title: "Red",
+        description: "Emergency stop or Protective stop",
+        color: Some("#ff0000"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Green",
+        description: "Ready for job",
+        color: Some("#00fa00"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Cyan",
+        description: "Drives to destination",
+        color: Some("#00fafa"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Purple",
+        description: "Goal/Path blocked",
+        color: Some("#f900f9"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Wavering white",
+        description: "Planning path",
+        color: None,
+        // CSS: linear-gradient(to right, white, black, white)
+        gradient: Some("90deg, white, black, white"),
+    },
+    LightIndicatorSpec {
+        title: "Orange",
+        description: "Mission paused",
+        color: Some("#fd7e14"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Wavering orange",
+        description: "Startup signal before PC is active",
+        color: None,
+        // CSS: linear-gradient(to right, #fd7e14, white, #fd7e14)
+        gradient: Some("90deg, #fd7e14, white, #fd7e14"),
+    },
+    LightIndicatorSpec {
+        title: "Fading orange",
+        description: "Shutting down robot",
+        color: None,
+        // CSS: linear-gradient(to bottom, #fd7e14, #fff3e0)
+        gradient: Some("180deg, #fd7e14, #fff3e0"),
+    },
+    LightIndicatorSpec {
+        title: "Blinking orange",
+        description: "Relative move, ignoring obstacles",
+        color: None,
+        // CSS uses repeating-linear-gradient; approximate one pulse period.
+        gradient: Some("90deg, transparent, #fd7e14 15%, #fd7e14 35%, transparent 50%"),
+    },
+    LightIndicatorSpec {
+        title: "Wavering purple and orange",
+        description: "General error",
+        color: None,
+        // CSS: linear-gradient(to right, #fd7e14, #a435f0, #fd7e14)
+        gradient: Some("90deg, #fd7e14, #a435f0, #fd7e14"),
+    },
+    LightIndicatorSpec {
+        title: "Blue",
+        description: "Manual drive",
+        color: Some("#0000ff"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Wavering blue",
+        description: "Mapping",
+        color: None,
+        // CSS: linear-gradient(to right, #0000ff, white, #0000ff)
+        gradient: Some("90deg, #0000ff, white, #0000ff"),
+    },
+    LightIndicatorSpec {
+        title: "Battery percentage",
+        description: "Charging at charging station",
+        color: None,
+        // CSS: linear-gradient(to right, #ff0000, transparent 25%)
+        gradient: Some("90deg, #ff0000, transparent 25%"),
+    },
+    LightIndicatorSpec {
+        title: "Wavering cyan",
+        description: "Waiting for MiR Fleet resource or for another MiR robot to move",
+        color: None,
+        // CSS: linear-gradient(to right, #00fafa, white, #00fafa)
+        gradient: Some("90deg, #00fafa, white, #00fafa"),
+    },
+];
+
+/// Description text colour — matches `.light-indicator-description` in
+/// `public/globals.css` (`#6c757d`).
+const LIGHT_INDICATOR_DESC_COLOR: &str = "#6c757d";
+
+/// Bar height / radius — matches `.light-indicator-bar` (5px, 2px radius).
+const LIGHT_INDICATOR_BAR_HEIGHT: f64 = 5.0;
+const LIGHT_INDICATOR_BAR_RADIUS: f64 = 2.0;
+
+/// Grid metrics — matches `.light-indicator-grid`
+/// (`minmax(150px, 1fr)`, `gap: 1.25rem` ≈ 15pt).
+const LIGHT_INDICATOR_MIN: f64 = 150.0;
+const LIGHT_INDICATOR_GAP: f64 = 15.0;
+
+/// Build a trivial Markdoc render node.
+fn light_rt_tag(name: &str, attrs: std::collections::HashMap<String, Scalar>, children: Vec<RenderableTreeNode>) -> RenderableTreeNode {
+    RenderableTreeNode::Tag(Box::new(Tag {
+        name: name.to_string(),
+        attributes: attrs,
+        children,
+    }))
+}
+
+fn light_rt_text(s: &str) -> RenderableTreeNode {
+    RenderableTreeNode::Scalar(Scalar::String(s.to_string()))
+}
+
+/// One grid cell: `{% swatch %}` bar + bold title + grey description.
+/// Title and description share one paragraph (hard-break between) so the
+/// gap matches the web's tight `.light-indicator-title` / description stack
+/// rather than two full `paragraph_space_after` gaps.
+fn light_indicator_cell(spec: &LightIndicatorSpec) -> Vec<RenderableTreeNode> {
+    let mut swatch_attrs = std::collections::HashMap::new();
+    if let Some(g) = spec.gradient {
+        swatch_attrs.insert("gradient".to_string(), Scalar::String(g.to_string()));
+    } else if let Some(c) = spec.color {
+        swatch_attrs.insert("color".to_string(), Scalar::String(c.to_string()));
+    }
+    swatch_attrs.insert(
+        "height".to_string(),
+        Scalar::Number(LIGHT_INDICATOR_BAR_HEIGHT),
+    );
+    swatch_attrs.insert(
+        "radius".to_string(),
+        Scalar::Number(LIGHT_INDICATOR_BAR_RADIUS),
+    );
+
+    let mut color_attrs = std::collections::HashMap::new();
+    color_attrs.insert(
+        "value".to_string(),
+        Scalar::String(LIGHT_INDICATOR_DESC_COLOR.to_string()),
+    );
+
+    let label = light_rt_tag(
+        "p",
+        std::collections::HashMap::new(),
+        vec![
+            light_rt_tag(
+                "strong",
+                std::collections::HashMap::new(),
+                vec![light_rt_text(spec.title)],
+            ),
+            light_rt_tag("hardbreak", std::collections::HashMap::new(), Vec::new()),
+            light_rt_tag(
+                "color",
+                color_attrs,
+                vec![light_rt_text(spec.description)],
+            ),
+        ],
+    );
+
+    vec![light_rt_tag("swatch", swatch_attrs, Vec::new()), label]
+}
+
+/// `{% lightindicators /%}` — status-light legend. Expands into a `{% grid %}`
+/// of `{% swatch %}` bars with bold titles and muted descriptions, using the
+/// same colours / gradients as the web `LightIndicators` component.
+fn layout_lightindicators(x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<Block> {
+    let items: Vec<RenderableTreeNode> = LIGHT_INDICATORS
+        .iter()
+        .map(|spec| {
+            light_rt_tag(
+                "li",
+                std::collections::HashMap::new(),
+                light_indicator_cell(spec),
+            )
+        })
+        .collect();
+
+    let ul = light_rt_tag("ul", std::collections::HashMap::new(), items);
+
+    let mut grid_attrs = std::collections::HashMap::new();
+    grid_attrs.insert("min".to_string(), Scalar::Number(LIGHT_INDICATOR_MIN));
+    grid_attrs.insert("gap".to_string(), Scalar::Number(LIGHT_INDICATOR_GAP));
+
+    let grid = Tag {
+        name: "grid".to_string(),
+        attributes: grid_attrs,
+        children: vec![ul],
+    };
+    let mut blocks = layout_grid(&grid, x, width, ctx);
+    // Match `.light-indicator-grid { margin: 1.25rem 0 }` — keep a bit of
+    // breathing room after the legend before the next section prose.
+    if let Some(last) = blocks.last_mut() {
+        last.space_after = LIGHT_INDICATOR_GAP as f32;
+    }
+    blocks
 }
 
 /// Build an SVG for a QR `code`: a `light` field with every dark module a

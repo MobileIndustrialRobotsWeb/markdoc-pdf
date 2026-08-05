@@ -7,7 +7,7 @@
 use clap::Parser;
 use flux_types::{FluxFrontmatter, HistoryEntry};
 use markdoc::{
-    Context, Node, evaluate_conditionals, parse, parse_with_variables,
+    Context, Node, evaluate_conditionals, parse,
     partials::{FsPartialResolver, expand_partials},
     resolve_crossrefs, resolve_footnotes, transform_with_context,
     types::{Config, NodeType, Scalar},
@@ -145,8 +145,9 @@ fn run(args: &Args) -> Result<(), AppError> {
     // ── Read + parse the source. ───────────────────────────────────
     let source =
         fs::read_to_string(&args.input).map_err(|e| AppError::Read(args.input.clone(), e))?;
-    let doc = parse_with_variables(&source, None, &cli_vars)
-        .map_err(|e| AppError::Parse(args.input.clone(), e.to_string()))?;
+    // Variables resolve at transform time via Context (below), not at parse.
+    let doc =
+        parse(&source, None).map_err(|e| AppError::Parse(args.input.clone(), e.to_string()))?;
 
     // Stitch a composed work together: if the root frontmatter carries a
     // Flux `sections` manifest, append a `{% partial %}` per section file so
@@ -221,7 +222,7 @@ fn run(args: &Args) -> Result<(), AppError> {
         .and_then(|fm| {
             fm.update_date
                 .as_deref()
-                .or(fm.first_release_date.as_deref())
+                .or(fm.release_date.as_deref())
         })
         .and_then(dates::parse_iso)
         .or_else(|| Some(dates::now()));
@@ -236,7 +237,7 @@ fn run(args: &Args) -> Result<(), AppError> {
     let date_string = fm_opt.as_ref().and_then(|fm| {
         fm.update_date
             .as_deref()
-            .or(fm.first_release_date.as_deref())
+            .or(fm.release_date.as_deref())
             .map(dates::iso_to_date_only)
     });
 
@@ -255,7 +256,7 @@ fn run(args: &Args) -> Result<(), AppError> {
     // `first–current`.
     let first_year = fm_opt
         .as_ref()
-        .and_then(|fm| fm.first_release_date.as_deref())
+        .and_then(|fm| fm.release_date.as_deref())
         .and_then(dates::year_of);
     vars.insert(
         "copyright_years".to_string(),
