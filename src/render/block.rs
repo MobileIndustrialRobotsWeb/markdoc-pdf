@@ -1257,6 +1257,10 @@ fn layout_node(
         // `{% lightindicators /%}` — status-light legend (swatch grid).
         "lightindicators" => layout_lightindicators(x, width, ctx),
 
+        // `{% noParaSpaceBox %}` — collapse inter-paragraph gaps (address /
+        // contact stacks in copyright).
+        "noParaSpaceBox" => layout_no_para_space_box(tag, x, width, ctx),
+
         // `{% qr %}` — a QR code from `value`.
         "qr" => layout_qr(tag, x, width, ctx),
 
@@ -3687,6 +3691,50 @@ fn layout_lightindicators(x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<Bl
     // breathing room after the legend before the next section prose.
     if let Some(last) = blocks.last_mut() {
         last.space_after = LIGHT_INDICATOR_GAP as f32;
+    }
+    blocks
+}
+
+/// Outer margin of `{% noParaSpaceBox %}` — matches `.noParaSpaceBox {
+/// margin: 15px 0 }` in `public/globals.css` (15 CSS px ≈ 11 pt).
+const NO_PARA_SPACE_BOX_MARGIN: f32 = 11.0;
+
+/// `{% noParaSpaceBox %}…{% /noParaSpaceBox %}` — lay children out normally,
+/// then collapse every inter-paragraph `space_after` to zero so address /
+/// contact lines stack as tightly as the web `.noParaSpaceBox p { margin: 0 }`
+/// rule. The box itself keeps a small trailing margin (CSS `15px`).
+fn layout_no_para_space_box(
+    tag: &Tag,
+    x: f32,
+    width: f32,
+    ctx: &mut LayoutCtx<'_>,
+) -> Vec<Block> {
+    // Skip blank / whitespace-only children so a leading blank line after the
+    // opening tag doesn't leave an empty gap at the top of the stack.
+    let children: Vec<&RenderableTreeNode> = tag
+        .children
+        .iter()
+        .filter(|c| match c {
+            RenderableTreeNode::Tag(t) => !node_text_is_blank(&t.children),
+            RenderableTreeNode::Scalar(Scalar::String(s)) => !s.trim().is_empty(),
+            RenderableTreeNode::Scalar(_) => true,
+        })
+        .collect();
+
+    let mut blocks = Vec::new();
+    for child in children {
+        blocks.extend(layout_node(child, x, width, ctx));
+    }
+    if blocks.is_empty() {
+        return blocks;
+    }
+    let last = blocks.len() - 1;
+    for (i, b) in blocks.iter_mut().enumerate() {
+        b.space_after = if i == last {
+            NO_PARA_SPACE_BOX_MARGIN
+        } else {
+            0.0
+        };
     }
     blocks
 }
