@@ -1379,6 +1379,11 @@ fn layout_node(
         // contact stacks in copyright).
         "noParaSpaceBox" => layout_no_para_space_box(tag, x, width, ctx),
 
+        // `{% imagegrid %}` / `{% gridimage %}` — illustrated side-by-side
+        // cells on a light grey panel (Locomotion, etc.).
+        "imagegrid" => layout_imagegrid(tag, x, width, ctx),
+        "gridimage" => layout_gridimage(tag, x, width, ctx),
+
         // `{% qr %}` — a QR code from `value`.
         "qr" => layout_qr(tag, x, width, ctx),
 
@@ -3855,6 +3860,111 @@ fn layout_no_para_space_box(
         };
     }
     blocks
+}
+
+/// Light grey panel behind `{% imagegrid %}` — matches `.imagegrid {
+/// background-color: #f9f9f9 }` in `public/globals.css`.
+const IMAGE_GRID_BG: &str = "#f9f9f9";
+
+/// Column gutter inside an image grid — matches `.imagegrid { gap: 10px }`.
+const IMAGE_GRID_GAP: f32 = 10.0;
+
+/// String attribute helper for gridimage / imagegrid layout.
+fn attr_string<'a>(
+    attrs: &'a std::collections::HashMap<String, Scalar>,
+    key: &str,
+) -> Option<&'a str> {
+    match attrs.get(key) {
+        Some(Scalar::String(s)) if !s.trim().is_empty() => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// Expand one `{% gridimage %}` into the column contents: media + bold
+/// headline + body paragraph (mirrors `MarkdocGridImage` on the web).
+fn gridimage_cell_nodes(tag: &Tag) -> Vec<RenderableTreeNode> {
+    let mut nodes = Vec::new();
+
+    let mut media_attrs = std::collections::HashMap::new();
+    if let Some(id) = attr_string(&tag.attributes, "id") {
+        media_attrs.insert("id".to_string(), Scalar::String(id.to_string()));
+    }
+    if let Some(alt) = attr_string(&tag.attributes, "alt") {
+        media_attrs.insert("alt".to_string(), Scalar::String(alt.to_string()));
+    }
+    // Fill the column — the locomotion examples are the main visual.
+    media_attrs.insert("size".to_string(), Scalar::String("large".to_string()));
+    nodes.push(light_rt_tag("media", media_attrs, Vec::new()));
+
+    if let Some(headline) = attr_string(&tag.attributes, "headline") {
+        nodes.push(light_rt_tag(
+            "p",
+            std::collections::HashMap::new(),
+            vec![light_rt_tag(
+                "strong",
+                std::collections::HashMap::new(),
+                vec![light_rt_text(headline)],
+            )],
+        ));
+    }
+
+    if let Some(body) = attr_string(&tag.attributes, "bodytext") {
+        nodes.push(light_rt_tag(
+            "p",
+            std::collections::HashMap::new(),
+            vec![light_rt_text(body)],
+        ));
+    }
+
+    nodes
+}
+
+/// `{% imagegrid %}…{% /imagegrid %}` — equal columns of `{% gridimage %}`
+/// cells on a light grey panel (Locomotion example, etc.).
+fn layout_imagegrid(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<Block> {
+    let cells: Vec<Vec<RenderableTreeNode>> = tag
+        .children
+        .iter()
+        .filter_map(|c| match c {
+            RenderableTreeNode::Tag(t) if t.name == "gridimage" => Some(gridimage_cell_nodes(t)),
+            _ => None,
+        })
+        .collect();
+
+    if cells.is_empty() {
+        // No gridimage children — fall back to laying out whatever is inside
+        // so content is not silently dropped.
+        return layout_children(&tag.children, x, width, ctx);
+    }
+
+    let bg = super::inline::parse_css_color(IMAGE_GRID_BG).unwrap_or_else(|| {
+        rgb::Color::new(0xF9, 0xF9, 0xF9)
+    });
+    let inner_x = x + PANEL_PAD;
+    let inner_w = width - 2.0 * PANEL_PAD;
+    let row = layout_cells_row(
+        cells,
+        inner_x,
+        inner_w,
+        IMAGE_GRID_GAP,
+        None,
+        None,
+        ctx,
+    );
+    vec![wrap_in_panel(
+        row,
+        x,
+        width,
+        bg,
+        ctx.style.paragraph_space_after,
+    )]
+}
+
+/// Standalone `{% gridimage %}` (outside an imagegrid) — stack media +
+/// headline + body at full column width, no grey panel.
+fn layout_gridimage(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<Block> {
+    let nodes = gridimage_cell_nodes(tag);
+    layout_children(&nodes, x, width, ctx)
 }
 
 /// Build an SVG for a QR `code`: a `light` field with every dark module a
