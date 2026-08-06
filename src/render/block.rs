@@ -114,6 +114,71 @@ impl Block {
         }
     }
 
+    /// True when this block is a heading (carries an outline entry).
+    pub fn is_heading(&self) -> bool {
+        self.outline.is_some()
+    }
+
+    /// True when this is a list item (marker + body).
+    pub fn is_list_item(&self) -> bool {
+        matches!(self.draw, BlockDraw::ListItem { .. })
+    }
+
+    /// Vertical whitespace spacer synthesised by layout (`spacer_block`).
+    pub fn is_spacer(&self) -> bool {
+        matches!(
+            self.draw,
+            BlockDraw::Rule {
+                width: 0.0,
+                thickness: 0.0,
+                ..
+            }
+        )
+    }
+
+    /// Image / SVG figure (including captioned ones).
+    pub fn is_figure(&self) -> bool {
+        matches!(
+            self.draw,
+            BlockDraw::Image { .. }
+                | BlockDraw::Svg { .. }
+                | BlockDraw::Float { .. }
+                | BlockDraw::FloatRegion { .. }
+        )
+    }
+
+    /// A table block.
+    pub fn is_table(&self) -> bool {
+        matches!(self.draw, BlockDraw::Table { .. })
+    }
+
+    /// Callout / notice / blockquote / panel — any `BoxedGroup` content
+    /// block (as opposed to a transparent grid-row wrapper used only for
+    /// pagination atomicity; those still count as real content when they
+    /// follow a heading).
+    pub fn is_boxed_text_block(&self) -> bool {
+        matches!(self.draw, BlockDraw::BoxedGroup { .. })
+    }
+
+    /// True when this block alone is enough content after a heading to
+    /// allow a page break: list item, figure, table, or a callout /
+    /// notice / other boxed text block. (Plain text still needs
+    /// ≥3 lines — see `heading_has_enough_followers`.)
+    pub fn is_substantial_follower(&self) -> bool {
+        self.is_list_item()
+            || self.is_figure()
+            || self.is_table()
+            || self.is_boxed_text_block()
+    }
+
+    /// Number of text lines in this block (paragraphs / headings only).
+    pub fn text_line_count(&self) -> usize {
+        match &self.draw {
+            BlockDraw::Text(slice) => slice.line_range.end.saturating_sub(slice.line_range.start),
+            _ => 0,
+        }
+    }
+
     /// Try to fit at most `remaining` of vertical space. Currently only
     /// `BlockDraw::Text` is splittable; other block kinds return `Whole`
     /// (if they fit) or `NoFit` (if they don't).
@@ -121,6 +186,30 @@ impl Block {
         let needed = self.height + self.space_after;
         if needed <= remaining {
             return SplitOutcome::Whole(self);
+        }
+        // Headings never split mid-title — move the whole heading to the
+        // next page so we never orphan part of a heading at the bottom.
+        if self.is_heading() {
+            let Block {
+                height,
+                space_after,
+                draw,
+                outline,
+                anchor_id,
+                tag_role,
+                page_column,
+                column_span,
+            } = self;
+            return SplitOutcome::NoFit(Block {
+                height,
+                space_after,
+                draw,
+                outline,
+                anchor_id,
+                tag_role,
+                page_column,
+                column_span,
+            });
         }
         let Block {
             height,
@@ -173,6 +262,10 @@ impl Block {
                 tag_role,
                 outline,
             ),
+            // List items stay atomic unless they are taller than the space
+            // on a fresh page (`remaining` ≈ full page). Mid-item breaks on
+            // a partially filled page are forbidden — return NoFit so the
+            // paginator moves the whole item.
             other => SplitOutcome::NoFit(Block {
                 height,
                 space_after,
@@ -187,6 +280,10 @@ impl Block {
     }
 }
 
+/// Minimum lines of a multi-line paragraph that may sit alone at the
+/// bottom or top of a page when the paragraph is split across pages.
+const TEXT_SPLIT_MIN_LINES: usize = 3;
+
 fn try_split_text(
     slice: TextSlice,
     space_after: f32,
@@ -199,6 +296,7 @@ fn try_split_text(
 ) -> SplitOutcome {
     let start = slice.line_range.start;
     let end = slice.line_range.end;
+    let total = end.saturating_sub(start);
     let mut acc = 0.0_f32;
     let mut split_at = start;
     for i in start..end {
@@ -234,6 +332,26 @@ fn try_split_text(
             column_span,
         });
     }
+
+    let head_lines = split_at - start;
+    let tail_lines = end - split_at;
+    // Orphan / widow control: don't leave fewer than TEXT_SPLIT_MIN_LINES
+    // on either side of a split when the paragraph is long enough.
+    if total >= TEXT_SPLIT_MIN_LINES
+        && (head_lines < TEXT_SPLIT_MIN_LINES || tail_lines < TEXT_SPLIT_MIN_LINES)
+    {
+        return SplitOutcome::NoFit(Block {
+            height: slice.height(),
+            space_after,
+            draw: BlockDraw::Text(slice),
+            outline,
+            anchor_id,
+            tag_role,
+            page_column,
+            column_span,
+        });
+    }
+
     let head_height: f32 = slice.line_heights[start..split_at].iter().sum();
     let tail_height: f32 = slice.line_heights[split_at..end].iter().sum();
     let head = Block {
