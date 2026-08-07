@@ -11,6 +11,7 @@
 
 mod block;
 mod coverpage;
+mod crossref_labels;
 mod decoration;
 mod emit;
 mod fonts;
@@ -219,6 +220,7 @@ pub fn render_pdf_with(
     let hyphenator = hyphen::WordHyphenator::from_style(&style.hyphenation);
 
     // 1. Layout.
+    let crossref_labels = crossref_labels::build_crossref_labels(root, &style.heading_numbering);
     let (blocks, footnotes) = {
         let mut lctx = LayoutCtx {
             style,
@@ -237,6 +239,7 @@ pub fn render_pdf_with(
             heading_counters: [0; 6],
             list_depth: 0,
             cell_content_align: None,
+            crossref_labels: &crossref_labels,
         };
         let blocks = block::layout_document(root, &mut lctx);
         (blocks, lctx.footnotes)

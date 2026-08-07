@@ -3,6 +3,7 @@
 //! each with its computed height and pre-laid-out content. Pagination
 //! and emission then operate on `Block`s without re-touching the AST.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use krilla::color::rgb;
@@ -1231,6 +1232,10 @@ pub struct LayoutCtx<'a> {
     /// cells; grid cells hold an image plus a headline plus body). `None`
     /// everywhere else, so ordinary paragraphs and figures are unaffected.
     pub cell_content_align: Option<parley::layout::Alignment>,
+    /// Precomputed `{% tag %}` id → display label for `{% tagref %}`
+    /// (e.g. `"6.5 Manual brake release"`). Built once before layout so
+    /// forward references resolve correctly.
+    pub crossref_labels: &'a HashMap<String, String>,
 }
 
 impl<'a> LayoutCtx<'a> {
@@ -1292,8 +1297,13 @@ impl<'a> LayoutCtx<'a> {
 /// Bumping a level resets all deeper levels, so a fresh `h2` after
 /// `1.3.4` yields `1.4` rather than `1.4.4`. Pulled out as a free
 /// function so the counter arithmetic is unit-testable without building
-/// a whole `LayoutCtx`.
-fn bump_heading_counters(counters: &mut [u32; 6], level: u8, max_depth: u8) -> Option<String> {
+/// a whole `LayoutCtx`, and reusable by the pre-layout crossref label
+/// pass.
+pub(crate) fn bump_heading_counters(
+    counters: &mut [u32; 6],
+    level: u8,
+    max_depth: u8,
+) -> Option<String> {
     if level == 0 || level > max_depth.clamp(1, 6) {
         return None;
     }
@@ -1743,7 +1753,8 @@ fn layout_paragraph(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> V
 
     let mut out = promoted;
 
-    let mut inlines = Inlines::from(&text_children, &mut ctx.footnotes);
+    let mut inlines =
+        Inlines::from_with_labels(&text_children, &mut ctx.footnotes, Some(ctx.crossref_labels));
     if inlines.text.trim().is_empty() {
         return out;
     }
@@ -4165,7 +4176,8 @@ fn layout_paragraph_float(
     let RenderableTreeNode::Tag(tag) = node else {
         return Vec::new();
     };
-    let mut inlines = Inlines::from(&tag.children, &mut ctx.footnotes);
+    let mut inlines =
+        Inlines::from_with_labels(&tag.children, &mut ctx.footnotes, Some(ctx.crossref_labels));
     if inlines.text.trim().is_empty() {
         return Vec::new();
     }
@@ -4480,7 +4492,11 @@ fn flatten_anchored(
                     anchors.push((ib.text.len(), (**t).clone()));
                 }
                 other => {
-                    let sub = Inlines::from(std::slice::from_ref(other), &mut ctx.footnotes);
+                    let sub = Inlines::from_with_labels(
+                        std::slice::from_ref(other),
+                        &mut ctx.footnotes,
+                        Some(ctx.crossref_labels),
+                    );
                     append_inlines(ib, sub);
                 }
             }
@@ -4505,7 +4521,11 @@ fn flatten_anchored(
                 if !ib.text.is_empty() {
                     ib.text.push_str("\n\n");
                 }
-                let sub = Inlines::from(std::slice::from_ref(other), &mut ctx.footnotes);
+                let sub = Inlines::from_with_labels(
+                    std::slice::from_ref(other),
+                    &mut ctx.footnotes,
+                    Some(ctx.crossref_labels),
+                );
                 append_inlines(&mut ib, sub);
             }
         }
@@ -5736,7 +5756,11 @@ fn layout_table_cell_paragraph(
     // Table cells don't carry document footnotes for v1 — the
     // pagination pool only attaches to top-level body blocks, so
     // routing cell footnotes there could end up on the wrong page.
-    let inlines = Inlines::from(&cell.children, &mut Vec::new());
+    let inlines = Inlines::from_with_labels(
+        &cell.children,
+        &mut Vec::new(),
+        Some(ctx.crossref_labels),
+    );
     if inlines.text.trim().is_empty() {
         return Vec::new();
     }

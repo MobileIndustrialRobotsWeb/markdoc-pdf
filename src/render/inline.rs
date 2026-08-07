@@ -2,6 +2,8 @@
 //! string plus a list of `InlineRange`s describing where bold/italic/
 //! strikethrough apply.
 
+use std::collections::HashMap;
+
 use markdoc::types::{RenderableTreeNode, Scalar};
 
 #[derive(Debug, Clone, Copy)]
@@ -92,9 +94,21 @@ impl Inlines {
     /// 1-based index. Pass a throwaway buffer at sites where footnotes
     /// shouldn't survive (captions, table cells, headings inside ToC,
     /// or measurement-only passes).
+    ///
+    /// `crossref_labels` maps `{% tag %}` ids to display text for
+    /// `{% tagref %}` (e.g. `"6.5 Manual brake release"`). When `None`
+    /// or missing an id, the raw anchor id is used as link text.
     pub fn from(children: &[RenderableTreeNode], footnotes: &mut Vec<String>) -> Self {
+        Self::from_with_labels(children, footnotes, None)
+    }
+
+    pub fn from_with_labels(
+        children: &[RenderableTreeNode],
+        footnotes: &mut Vec<String>,
+        crossref_labels: Option<&HashMap<String, String>>,
+    ) -> Self {
         let mut i = Self::new();
-        collect_into(&mut i, children, footnotes);
+        collect_into(&mut i, children, footnotes, crossref_labels);
         i
     }
 }
@@ -196,12 +210,17 @@ pub fn collect_inlines(
         mid_anchors: Vec::new(),
         footnote_calls: Vec::new(),
     };
-    collect_into(&mut tmp, children, footnotes);
+    collect_into(&mut tmp, children, footnotes, None);
     *text = tmp.text;
     *ranges = tmp.style_ranges;
 }
 
-fn collect_into(out: &mut Inlines, children: &[RenderableTreeNode], footnotes: &mut Vec<String>) {
+fn collect_into(
+    out: &mut Inlines,
+    children: &[RenderableTreeNode],
+    footnotes: &mut Vec<String>,
+    crossref_labels: Option<&HashMap<String, String>>,
+) {
     for child in children {
         match child {
             RenderableTreeNode::Scalar(Scalar::String(s)) => out.text.push_str(s),
@@ -225,7 +244,7 @@ fn collect_into(out: &mut Inlines, children: &[RenderableTreeNode], footnotes: &
                         // either side stay separated; let parley pick
                         // the wrap point.
                         out.text.push(' ');
-                        collect_into(out, &t.children, footnotes);
+                        collect_into(out, &t.children, footnotes, crossref_labels);
                         continue;
                     }
                     "br" | "hardbreak" => {
@@ -233,7 +252,7 @@ fn collect_into(out: &mut Inlines, children: &[RenderableTreeNode], footnotes: &
                         // backslash). Force a line break — parley treats
                         // U+000A as a mandatory break.
                         out.text.push('\n');
-                        collect_into(out, &t.children, footnotes);
+                        collect_into(out, &t.children, footnotes, crossref_labels);
                         continue;
                     }
                     "a" => {
@@ -247,7 +266,7 @@ fn collect_into(out: &mut Inlines, children: &[RenderableTreeNode], footnotes: &
                             _ => None,
                         };
                         let start = out.text.len();
-                        collect_into(out, &t.children, footnotes);
+                        collect_into(out, &t.children, footnotes, crossref_labels);
                         let end = out.text.len();
                         if let Some(href) = href
                             && end > start
@@ -287,7 +306,7 @@ fn collect_into(out: &mut Inlines, children: &[RenderableTreeNode], footnotes: &
                         // the body once collected.
                         footnotes.push(String::new());
                         let mut body = Inlines::new();
-                        collect_into(&mut body, &t.children, footnotes);
+                        collect_into(&mut body, &t.children, footnotes, crossref_labels);
                         let body_text = body.text.trim().to_string();
                         if let Some(slot) = footnotes.get_mut((number - 1) as usize) {
                             *slot = body_text;
@@ -306,8 +325,10 @@ fn collect_into(out: &mut Inlines, children: &[RenderableTreeNode], footnotes: &
                         //
                         //   {% tagref id="X" /%}            — intra-doc.
                         //     Resolved to a PDF GoTo destination at emit
-                        //     time via the anchor map. Renders the id as
-                        //     link text.
+                        //     time via the anchor map. Link text is the
+                        //     precomputed section label when available
+                        //     (e.g. "6.5 Manual brake release"), else
+                        //     the raw anchor id.
                         //
                         //   {% tagref doc="D" id="X" /%}    — cross-doc.
                         //     Adeptus is meant to rewrite this BEFORE
@@ -332,8 +353,12 @@ fn collect_into(out: &mut Inlines, children: &[RenderableTreeNode], footnotes: &
                                 out.text.push_str(&placeholder);
                             }
                             (None, Some(id)) => {
+                                let label = crossref_labels
+                                    .and_then(|m| m.get(&id))
+                                    .cloned()
+                                    .unwrap_or_else(|| id.clone());
                                 let start = out.text.len();
-                                out.text.push_str(&id);
+                                out.text.push_str(&label);
                                 let end = out.text.len();
                                 out.links.push(LinkRange {
                                     start,
@@ -447,7 +472,7 @@ fn collect_into(out: &mut Inlines, children: &[RenderableTreeNode], footnotes: &
                     _ => None,
                 };
                 let start = out.text.len();
-                collect_into(out, &t.children, footnotes);
+                collect_into(out, &t.children, footnotes, crossref_labels);
                 let end = out.text.len();
                 if let Some(p) = prop
                     && end > start
