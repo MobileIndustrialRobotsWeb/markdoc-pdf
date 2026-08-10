@@ -60,11 +60,20 @@ pub fn build_coverpage_blocks(
     // Optional logo / hero image (best-effort — silently skipped on
     // decode failure). Decoded once here so we can place it either
     // above the title or between title and subtitle without
-    // duplicating the asset-resolver code.
-    let logo_block = coverpage
-        .logo
-        .as_ref()
-        .and_then(|logo| build_logo_block(logo, body_left, column_w, coverpage.align, assets));
+    // duplicating the asset-resolver code. `src` is a template so
+    // covers can pick a product image from frontmatter, e.g.
+    // `{title}.png` → `MiR250 Manual.png`.
+    let logo_block = coverpage.logo.as_ref().and_then(|logo| {
+        build_logo_block(
+            logo,
+            body_left,
+            column_w,
+            coverpage.align,
+            assets,
+            render_ctx,
+            date_str,
+        )
+    });
 
     // Logo above the title (default).
     if coverpage.logo_position == LogoPosition::Above
@@ -211,9 +220,18 @@ pub fn build_coverpage_blocks(
 
     // Optional hero image (e.g. a product photo) below the metadata. Drawn
     // from its own slot so a cover can carry both a brand logo (above the
-    // title) and a hero image.
+    // title) and a hero image. Same `{title}` / frontmatter substitution
+    // as detail lines so one style can serve every product manual.
     if let Some(hero) = &coverpage.hero
-        && let Some(block) = build_logo_block(hero, body_left, column_w, coverpage.align, assets)
+        && let Some(block) = build_logo_block(
+            hero,
+            body_left,
+            column_w,
+            coverpage.align,
+            assets,
+            render_ctx,
+            date_str,
+        )
     {
         if coverpage.hero_gap > 0.0 {
             out.push(spacer_block(body_left, coverpage.hero_gap));
@@ -423,17 +441,22 @@ fn cover_text_block(
 /// Decode the configured logo via the asset resolver and return a
 /// centred Image (raster) or Svg block. Width/height come from the
 /// `LogoSpec`; horizontal position is centred in the body column.
+/// `src` supports the same `{title}` / frontmatter templates as cover
+/// text so hero art can be selected per document.
 fn build_logo_block(
     logo: &super::style::LogoSpec,
     body_left: f32,
     column_w: f32,
     align: CoverAlign,
     assets: &dyn AssetResolver,
+    render_ctx: &RenderContext,
+    date_str: &str,
 ) -> Option<Block> {
-    if logo.src.is_empty() || logo.width <= 0.0 || logo.height <= 0.0 {
+    let src = substitute(&logo.src, render_ctx, date_str);
+    if src.is_empty() || logo.width <= 0.0 || logo.height <= 0.0 {
         return None;
     }
-    let bytes = assets.fetch(&logo.src).ok()?;
+    let bytes = assets.fetch(&src).ok()?;
     let format = sniff_format(&bytes);
     let x = cover_image_x(body_left, column_w, logo.width, align);
     let block = match format {
@@ -491,5 +514,46 @@ fn cover_image_x(body_left: f32, column_w: f32, width: f32, align: CoverAlign) -
     match align {
         CoverAlign::Left => body_left,
         CoverAlign::Center => body_left + (column_w - width).max(0.0) * 0.5,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn hero_src_substitutes_title() {
+        let ctx = RenderContext {
+            title: "MiR250 Manual".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            substitute("{title}.png", &ctx, ""),
+            "MiR250 Manual.png"
+        );
+    }
+
+    #[test]
+    fn hero_src_leaves_static_path_unchanged() {
+        let ctx = RenderContext::default();
+        assert_eq!(
+            substitute("MiR_Logo=Positive.svg", &ctx, ""),
+            "MiR_Logo=Positive.svg"
+        );
+    }
+
+    #[test]
+    fn hero_src_substitutes_frontmatter_vars() {
+        let mut vars = HashMap::new();
+        vars.insert("productImage".into(), "MiR250 Hook Manual".into());
+        let ctx = RenderContext {
+            vars,
+            ..Default::default()
+        };
+        assert_eq!(
+            substitute("{productImage}.png", &ctx, ""),
+            "MiR250 Hook Manual.png"
+        );
     }
 }

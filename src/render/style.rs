@@ -793,7 +793,9 @@ pub struct CoverPageStyle {
     pub logo_position: LogoPosition,
     /// Optional hero image (e.g. a product photo) drawn below the cover
     /// metadata — a second image slot so a cover can show both a brand
-    /// logo (above the title) and a hero image.
+    /// logo (above the title) and a hero image. `src` is a template
+    /// (`{title}` / any frontmatter var), so e.g. `{title}.png` resolves
+    /// to an asset named after the document title.
     pub hero: Option<LogoSpec>,
     /// Gap above the hero image.
     pub hero_gap: f32,
