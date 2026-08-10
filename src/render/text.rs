@@ -71,12 +71,18 @@ pub fn default_families() -> &'static [&'static str] {
         // skips families it can't find).
         "Noto Sans Symbols 2",
         "Noto Sans Math",
-        // Broad cross-platform sans-serif fallbacks. At least one of
-        // these is installed by default on Fedora / Debian / Ubuntu
-        // (DejaVu, Liberation Sans), macOS / older Windows (Arial
-        // Unicode MS), and modern Windows (Segoe UI Symbol).
+        // Broad cross-platform sans-serif fallbacks. Prefer families
+        // that ship Bold/Italic faces — without them, `**bold**` /
+        // `_italic_` request weight/style that never resolve and the
+        // PDF stays visually regular. DejaVu / Liberation cover Linux;
+        // Arial / Segoe UI cover Windows and macOS. Keep Arial Unicode
+        // MS and Segoe UI Symbol after those: they cover arrows/math
+        // glyphs but typically have no useful Bold/Italic Latin faces.
         "DejaVu Sans",
         "Liberation Sans",
+        "Arial",
+        "Segoe UI",
+        "Helvetica",
         "Arial Unicode MS",
         "Segoe UI Symbol",
         // CJK — deliberately after the symbol / broad-Unicode fallbacks. The

@@ -359,6 +359,27 @@ impl CalloutStyles {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct PageLayoutStyle {
+    /// Number of text columns on each body page (1 = default full-width column).
+    pub columns: u8,
+    /// Horizontal gap between columns, in points.
+    pub gap: f32,
+    /// Headings at this level and above span all columns (1 = H1 only).
+    pub span_heading_through: u8,
+}
+
+impl Default for PageLayoutStyle {
+    fn default() -> Self {
+        Self {
+            columns: 1,
+            gap: 20.0,
+            span_heading_through: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct Style {
     /// Schema-version stamp; reserved for future incompatible bumps.
     pub schema_version: u32,
@@ -368,6 +389,8 @@ pub struct Style {
     pub page_height: f32,
     pub margin_x: f32,
     pub margin_y: f32,
+    /// Multi-column body layout (1 = single column, the default).
+    pub page_layout: PageLayoutStyle,
     /// When the rendered document ends on an odd page, append one page so
     /// the physical total is even. Intended for duplex (double-sided)
     /// printing, where each new document should begin on the front of a
@@ -553,6 +576,7 @@ impl Default for Style {
             page_height: 842.0, // A4 — real page size now that we paginate
             margin_x: 72.0,
             margin_y: 72.0,
+            page_layout: PageLayoutStyle::default(),
             pad_to_even: false,
             text_align: TextAlign::default(),
             body_font_size: 11.0,

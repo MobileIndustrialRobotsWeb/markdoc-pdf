@@ -59,6 +59,12 @@ struct Args {
     /// and tag attributes. The value is always treated as a string.
     #[arg(long = "var", value_name = "KEY=VALUE")]
     var: Vec<String>,
+
+    /// JSON file of build-time variables (same shape as Markdoc config).
+    /// Top-level keys become `$key` in conditionals and interpolation.
+    /// `--var` entries override keys from this file.
+    #[arg(long, value_name = "FILE")]
+    variables: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -107,8 +113,24 @@ fn run(args: &Args) -> Result<(), AppError> {
         None => Style::default(),
     };
 
-    // ── Collect CLI `--var key=value` build-time variables. ────────
+    // ── Collect build-time variables (`--variables` file + `--var`). ─
     let mut cli_vars: HashMap<String, Scalar> = HashMap::new();
+    if let Some(path) = &args.variables {
+        if !path.exists() {
+            return Err(AppError::VariablesMissing(path.clone()));
+        }
+        let raw = fs::read_to_string(path).map_err(|e| AppError::Read(path.clone(), e))?;
+        let json: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| AppError::VariablesLoad(path.clone(), e.to_string()))?;
+        if let serde_json::Value::Object(map) = json {
+            for (key, value) in map {
+                if key == "$schema" {
+                    continue;
+                }
+                cli_vars.insert(key, json_to_scalar(&value));
+            }
+        }
+    }
     for pair in &args.var {
         match pair.split_once('=') {
             Some((k, v)) => {
@@ -123,6 +145,7 @@ fn run(args: &Args) -> Result<(), AppError> {
     // ── Read + parse the source. ───────────────────────────────────
     let source =
         fs::read_to_string(&args.input).map_err(|e| AppError::Read(args.input.clone(), e))?;
+    // Variables resolve at transform time via Context (below), not at parse.
     let doc =
         parse(&source, None).map_err(|e| AppError::Parse(args.input.clone(), e.to_string()))?;
 
@@ -196,7 +219,11 @@ fn run(args: &Args) -> Result<(), AppError> {
     };
     let creation_date = fm_opt
         .as_ref()
-        .and_then(|fm| fm.release_date.as_deref())
+        .and_then(|fm| {
+            fm.update_date
+                .as_deref()
+                .or(fm.release_date.as_deref())
+        })
         .and_then(dates::parse_iso)
         .or_else(|| Some(dates::now()));
     let authors = fm_opt
@@ -207,10 +234,12 @@ fn run(args: &Args) -> Result<(), AppError> {
         .as_ref()
         .and_then(|fm| fm.creator.clone())
         .or_else(|| Some("markdoc-pdf".to_string()));
-    let date_string = fm_opt
-        .as_ref()
-        .and_then(|fm| fm.release_date.as_deref())
-        .map(dates::iso_to_date_only);
+    let date_string = fm_opt.as_ref().and_then(|fm| {
+        fm.update_date
+            .as_deref()
+            .or(fm.release_date.as_deref())
+            .map(dates::iso_to_date_only)
+    });
 
     // Expose the document's own frontmatter as template variables for
     // header/footer and cover-page templates (`{version}`, `{language}`,
@@ -382,6 +411,24 @@ fn document_history_nodes(history: &[HistoryEntry], title: Option<&str>) -> Vec<
     parse(&src, None).map(|d| d.children).unwrap_or_default()
 }
 
+/// Convert a JSON value from `--variables` into Markdoc's `Scalar` type.
+fn json_to_scalar(value: &serde_json::Value) -> Scalar {
+    match value {
+        serde_json::Value::Null => Scalar::Null,
+        serde_json::Value::Bool(b) => Scalar::Boolean(*b),
+        serde_json::Value::Number(n) => Scalar::Number(n.as_f64().unwrap_or(0.0)),
+        serde_json::Value::String(s) => Scalar::String(s.clone()),
+        serde_json::Value::Array(items) => {
+            Scalar::Array(items.iter().map(json_to_scalar).collect())
+        }
+        serde_json::Value::Object(map) => Scalar::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_to_scalar(v)))
+                .collect(),
+        ),
+    }
+}
+
 /// Surface every scalar frontmatter field as a template variable keyed
 /// by its authored name. Nested values (arrays / objects) and empty
 /// strings are skipped — they have no single sensible string form. The
@@ -424,6 +471,8 @@ enum AppError {
     OutputDirMissing(PathBuf),
     AssetsRootMissing(PathBuf),
     StyleLoad(PathBuf, String),
+    VariablesMissing(PathBuf),
+    VariablesLoad(PathBuf, String),
     Read(PathBuf, std::io::Error),
     Write(PathBuf, std::io::Error),
     Parse(PathBuf, String),
@@ -463,7 +512,7 @@ impl AppError {
                 "partial paths are resolved against the input file's directory; check spelling and that the file exists.".into(),
             ],
             AppError::Conditionals(_, _) => vec![
-                "{% if expr %} branches must reference variables defined in frontmatter, via --var, or via Context.".into(),
+                "{% if expr %} branches must reference variables defined in frontmatter, via --var / --variables, or via Context.".into(),
             ],
             AppError::Transform(_, _) => vec![
                 "transform errors usually mean a tag failed schema validation — check the spelling and required attributes.".into(),
@@ -486,6 +535,12 @@ impl std::fmt::Display for AppError {
             }
             AppError::StyleLoad(p, msg) => {
                 write!(f, "couldn't load style {}: {msg}", p.display())
+            }
+            AppError::VariablesMissing(p) => {
+                write!(f, "variables file not found: {}", p.display())
+            }
+            AppError::VariablesLoad(p, msg) => {
+                write!(f, "couldn't load variables {}: {msg}", p.display())
             }
             AppError::Read(p, e) => write!(f, "couldn't read {}: {e}", p.display()),
             AppError::Write(p, e) => write!(f, "couldn't write {}: {e}", p.display()),

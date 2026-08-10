@@ -189,3 +189,16 @@ filesystem) is post-MVP.
 ## License
 
 MIT.
+
+## MiR Modifications
+
+* Support for light indicator table and image grids
+* Support for various image sizes
+* Implemetned following page-break rules: 
+  * Page-breaks cannot occur right after a heading
+  * Page-breaks cannot occur just before a list starts (Page-breaks can be in the middle of a list)
+  * Page-breaks cannot occur in the middle of a list item, unless the list item is longer than a page.
+  * There must be at least three lines of text, a complete paragraph, an image, a notice block, or a table before a page-break.
+* Support for column size control
+* Bold and italics fix
+* Condition and varaible support.

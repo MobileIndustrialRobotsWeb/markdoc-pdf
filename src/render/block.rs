@@ -3,6 +3,7 @@
 //! each with its computed height and pre-laid-out content. Pagination
 //! and emission then operate on `Block`s without re-touching the AST.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use krilla::color::rgb;
@@ -44,6 +45,10 @@ pub struct Block {
     /// tag instead of the default `P`. Used by the footnote pool to
     /// emit each entry as `Note`.
     pub tag_role: Option<TagRole>,
+    /// Page column index when `page_layout.columns > 1` (0 = left).
+    pub page_column: u8,
+    /// When true the block spans every column on the page (e.g. H1, tables).
+    pub column_span: bool,
 }
 
 /// Override for the structure-tree tag emit assigns to a Text block.
@@ -110,6 +115,71 @@ impl Block {
         }
     }
 
+    /// True when this block is a heading (carries an outline entry).
+    pub fn is_heading(&self) -> bool {
+        self.outline.is_some()
+    }
+
+    /// True when this is a list item (marker + body).
+    pub fn is_list_item(&self) -> bool {
+        matches!(self.draw, BlockDraw::ListItem { .. })
+    }
+
+    /// Vertical whitespace spacer synthesised by layout (`spacer_block`).
+    pub fn is_spacer(&self) -> bool {
+        matches!(
+            self.draw,
+            BlockDraw::Rule {
+                width: 0.0,
+                thickness: 0.0,
+                ..
+            }
+        )
+    }
+
+    /// Image / SVG figure (including captioned ones).
+    pub fn is_figure(&self) -> bool {
+        matches!(
+            self.draw,
+            BlockDraw::Image { .. }
+                | BlockDraw::Svg { .. }
+                | BlockDraw::Float { .. }
+                | BlockDraw::FloatRegion { .. }
+        )
+    }
+
+    /// A table block.
+    pub fn is_table(&self) -> bool {
+        matches!(self.draw, BlockDraw::Table { .. })
+    }
+
+    /// Callout / notice / blockquote / panel — any `BoxedGroup` content
+    /// block (as opposed to a transparent grid-row wrapper used only for
+    /// pagination atomicity; those still count as real content when they
+    /// follow a heading).
+    pub fn is_boxed_text_block(&self) -> bool {
+        matches!(self.draw, BlockDraw::BoxedGroup { .. })
+    }
+
+    /// True when this block alone is enough content after a heading to
+    /// allow a page break: list item, figure, table, or a callout /
+    /// notice / other boxed text block. (Plain text still needs
+    /// ≥3 lines — see `heading_has_enough_followers`.)
+    pub fn is_substantial_follower(&self) -> bool {
+        self.is_list_item()
+            || self.is_figure()
+            || self.is_table()
+            || self.is_boxed_text_block()
+    }
+
+    /// Number of text lines in this block (paragraphs / headings only).
+    pub fn text_line_count(&self) -> usize {
+        match &self.draw {
+            BlockDraw::Text(slice) => slice.line_range.end.saturating_sub(slice.line_range.start),
+            _ => 0,
+        }
+    }
+
     /// Try to fit at most `remaining` of vertical space. Currently only
     /// `BlockDraw::Text` is splittable; other block kinds return `Whole`
     /// (if they fit) or `NoFit` (if they don't).
@@ -118,9 +188,51 @@ impl Block {
         if needed <= remaining {
             return SplitOutcome::Whole(self);
         }
-        let anchor_id = self.anchor_id.clone();
-        match self.draw {
-            BlockDraw::Text(slice) => try_split_text(slice, self.space_after, remaining),
+        // Headings never split mid-title — move the whole heading to the
+        // next page so we never orphan part of a heading at the bottom.
+        if self.is_heading() {
+            let Block {
+                height,
+                space_after,
+                draw,
+                outline,
+                anchor_id,
+                tag_role,
+                page_column,
+                column_span,
+            } = self;
+            return SplitOutcome::NoFit(Block {
+                height,
+                space_after,
+                draw,
+                outline,
+                anchor_id,
+                tag_role,
+                page_column,
+                column_span,
+            });
+        }
+        let Block {
+            height,
+            space_after,
+            draw,
+            outline,
+            anchor_id,
+            tag_role,
+            page_column,
+            column_span,
+        } = self;
+        match draw {
+            BlockDraw::Text(slice) => try_split_text(
+                slice,
+                space_after,
+                remaining,
+                page_column,
+                column_span,
+                tag_role,
+                anchor_id,
+                outline,
+            ),
             BlockDraw::Table {
                 x,
                 column_widths,
@@ -142,27 +254,50 @@ impl Block {
                 border_thickness,
                 border_style,
                 edge,
-                self.space_after,
+                space_after,
                 remaining,
                 anchor_id,
                 caption,
+                page_column,
+                column_span,
+                tag_role,
+                outline,
             ),
+            // List items stay atomic unless they are taller than the space
+            // on a fresh page (`remaining` ≈ full page). Mid-item breaks on
+            // a partially filled page are forbidden — return NoFit so the
+            // paginator moves the whole item.
             other => SplitOutcome::NoFit(Block {
-                height: self.height,
-                space_after: self.space_after,
+                height,
+                space_after,
                 draw: other,
-                outline: None,
+                outline,
                 anchor_id,
-
-                tag_role: None,
+                tag_role,
+                page_column,
+                column_span,
             }),
         }
     }
 }
 
-fn try_split_text(slice: TextSlice, space_after: f32, remaining: f32) -> SplitOutcome {
+/// Minimum lines of a multi-line paragraph that may sit alone at the
+/// bottom or top of a page when the paragraph is split across pages.
+const TEXT_SPLIT_MIN_LINES: usize = 3;
+
+fn try_split_text(
+    slice: TextSlice,
+    space_after: f32,
+    remaining: f32,
+    page_column: u8,
+    column_span: bool,
+    tag_role: Option<TagRole>,
+    anchor_id: Option<String>,
+    outline: Option<OutlineEntry>,
+) -> SplitOutcome {
     let start = slice.line_range.start;
     let end = slice.line_range.end;
+    let total = end.saturating_sub(start);
     let mut acc = 0.0_f32;
     let mut split_at = start;
     for i in start..end {
@@ -179,10 +314,11 @@ fn try_split_text(slice: TextSlice, space_after: f32, remaining: f32) -> SplitOu
             height: slice.height(),
             space_after,
             draw: BlockDraw::Text(slice),
-            outline: None,
-            anchor_id: None,
-
-            tag_role: None,
+            outline,
+            anchor_id,
+            tag_role,
+            page_column,
+            column_span,
         });
     }
     if split_at == end {
@@ -190,12 +326,33 @@ fn try_split_text(slice: TextSlice, space_after: f32, remaining: f32) -> SplitOu
             height: slice.height(),
             space_after,
             draw: BlockDraw::Text(slice),
-            outline: None,
-            anchor_id: None,
-
-            tag_role: None,
+            outline,
+            anchor_id,
+            tag_role,
+            page_column,
+            column_span,
         });
     }
+
+    let head_lines = split_at - start;
+    let tail_lines = end - split_at;
+    // Orphan / widow control: don't leave fewer than TEXT_SPLIT_MIN_LINES
+    // on either side of a split when the paragraph is long enough.
+    if total >= TEXT_SPLIT_MIN_LINES
+        && (head_lines < TEXT_SPLIT_MIN_LINES || tail_lines < TEXT_SPLIT_MIN_LINES)
+    {
+        return SplitOutcome::NoFit(Block {
+            height: slice.height(),
+            space_after,
+            draw: BlockDraw::Text(slice),
+            outline,
+            anchor_id,
+            tag_role,
+            page_column,
+            column_span,
+        });
+    }
+
     let head_height: f32 = slice.line_heights[start..split_at].iter().sum();
     let tail_height: f32 = slice.line_heights[split_at..end].iter().sum();
     let head = Block {
@@ -212,10 +369,11 @@ fn try_split_text(slice: TextSlice, space_after: f32, remaining: f32) -> SplitOu
             line_range: start..split_at,
             skip_y: slice.skip_y,
         }),
-        outline: None,
-        anchor_id: None,
-
-        tag_role: None,
+        outline: outline.clone(),
+        anchor_id: anchor_id.clone(),
+        tag_role,
+        page_column,
+        column_span,
     };
     let tail = Block {
         height: tail_height,
@@ -231,10 +389,11 @@ fn try_split_text(slice: TextSlice, space_after: f32, remaining: f32) -> SplitOu
             footnote_calls: slice.footnote_calls,
             line_heights: slice.line_heights,
         }),
-        outline: None,
-        anchor_id: None,
-
+        outline,
+        anchor_id,
         tag_role: None,
+        page_column,
+        column_span,
     };
     SplitOutcome::Split(head, tail)
 }
@@ -254,6 +413,10 @@ fn try_split_table(
     remaining: f32,
     anchor_id: Option<String>,
     caption: Option<String>,
+    page_column: u8,
+    column_span: bool,
+    tag_role: Option<TagRole>,
+    outline: Option<OutlineEntry>,
 ) -> SplitOutcome {
     // Header rows form a contiguous prefix (`is_header == true`); they
     // repeat on every continuation page.
@@ -305,8 +468,12 @@ fn try_split_table(
                     border_style,
                     edge,
                     0.0,
-                    anchor_id,
+                    anchor_id.clone(),
                     caption.clone(),
+                    page_column,
+                    column_span,
+                    tag_role,
+                    outline.clone(),
                 );
                 let tail_block = make_table_block(
                     x,
@@ -319,6 +486,10 @@ fn try_split_table(
                     border_style,
                     edge,
                     space_after,
+                    None,
+                    None,
+                    page_column,
+                    column_span,
                     None,
                     None,
                 );
@@ -338,6 +509,10 @@ fn try_split_table(
             space_after,
             anchor_id,
             caption,
+            page_column,
+            column_span,
+            tag_role,
+            outline,
         ));
     }
     if header_count + included_body == rows.len() {
@@ -354,6 +529,10 @@ fn try_split_table(
             space_after,
             anchor_id,
             caption,
+            page_column,
+            column_span,
+            tag_role,
+            outline,
         ));
     }
 
@@ -380,6 +559,10 @@ fn try_split_table(
         0.0,
         anchor_id,
         caption.clone(),
+        page_column,
+        column_span,
+        tag_role,
+        outline.clone(),
     );
     let tail_block = make_table_block(
         x,
@@ -392,6 +575,10 @@ fn try_split_table(
         border_style,
         edge,
         space_after,
+        None,
+        None,
+        page_column,
+        column_span,
         None,
         None,
     );
@@ -513,6 +700,10 @@ fn make_table_block(
     space_after: f32,
     anchor_id: Option<String>,
     caption: Option<String>,
+    page_column: u8,
+    column_span: bool,
+    tag_role: Option<TagRole>,
+    outline: Option<OutlineEntry>,
 ) -> Block {
     let height: f32 =
         rows.iter().map(|r| r.height).sum::<f32>() + border_thickness * (rows.len() as f32 + 1.0);
@@ -531,10 +722,12 @@ fn make_table_block(
             edge,
             caption,
         },
-        outline: None,
+        outline,
         anchor_id,
 
-        tag_role: None,
+        tag_role,
+        page_column,
+        column_span,
     }
 }
 
@@ -907,6 +1100,8 @@ pub fn build_footnote_pool_blocks(
         anchor_id: None,
 
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     });
     let rule_w = (inner_w * style.footnote.rule_width_frac).max(0.0);
     out.push(Block {
@@ -922,6 +1117,8 @@ pub fn build_footnote_pool_blocks(
         anchor_id: None,
 
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     });
 
     // 2. One paragraph per footnote: "ⁿ body text".
@@ -951,6 +1148,8 @@ pub fn build_footnote_pool_blocks(
             outline: None,
             anchor_id: None,
             tag_role: Some(TagRole::Note),
+            page_column: 0,
+            column_span: false,
         });
     }
     out
@@ -1026,6 +1225,10 @@ pub struct LayoutCtx<'a> {
     /// cells; grid cells hold an image plus a headline plus body). `None`
     /// everywhere else, so ordinary paragraphs and figures are unaffected.
     pub cell_content_align: Option<parley::layout::Alignment>,
+    /// Precomputed `{% tag %}` id → display label for `{% tagref %}`
+    /// (e.g. `"6.5 Manual brake release"`). Built once before layout so
+    /// forward references resolve correctly.
+    pub crossref_labels: &'a HashMap<String, String>,
 }
 
 impl<'a> LayoutCtx<'a> {
@@ -1056,6 +1259,28 @@ impl<'a> LayoutCtx<'a> {
         }
         bump_heading_counters(&mut self.heading_counters, level, cfg.max_depth)
     }
+
+    pub fn page_columns(&self) -> u8 {
+        self.style.page_layout.columns.max(1)
+    }
+
+    pub fn body_full_width(&self) -> f32 {
+        self.style.page_width - 2.0 * self.style.margin_x
+    }
+
+    pub fn body_column_width(&self) -> f32 {
+        let cols = self.page_columns();
+        let full = self.body_full_width();
+        if cols <= 1 {
+            return full;
+        }
+        let gap = self.style.page_layout.gap;
+        (full - gap * (cols as f32 - 1.0)) / cols as f32
+    }
+
+    pub fn heading_spans_columns(&self, level: u8) -> bool {
+        self.page_columns() > 1 && level <= self.style.page_layout.span_heading_through
+    }
 }
 
 /// Advance `counters` for a heading at `level` (1-based) and format the
@@ -1065,8 +1290,13 @@ impl<'a> LayoutCtx<'a> {
 /// Bumping a level resets all deeper levels, so a fresh `h2` after
 /// `1.3.4` yields `1.4` rather than `1.4.4`. Pulled out as a free
 /// function so the counter arithmetic is unit-testable without building
-/// a whole `LayoutCtx`.
-fn bump_heading_counters(counters: &mut [u32; 6], level: u8, max_depth: u8) -> Option<String> {
+/// a whole `LayoutCtx`, and reusable by the pre-layout crossref label
+/// pass.
+pub(crate) fn bump_heading_counters(
+    counters: &mut [u32; 6],
+    level: u8,
+    max_depth: u8,
+) -> Option<String> {
     if level == 0 || level > max_depth.clamp(1, 6) {
         return None;
     }
@@ -1093,7 +1323,7 @@ pub fn null_resolver() -> &'static dyn AssetResolver {
 /// Top-level entry: lay out a transformed Markdoc document into blocks.
 pub fn layout_document(root: &RenderableTreeNode, ctx: &mut LayoutCtx<'_>) -> Vec<Block> {
     let column_x = ctx.style.margin_x;
-    let column_w = ctx.style.page_width - 2.0 * ctx.style.margin_x;
+    let column_w = ctx.body_column_width();
     layout_node(root, column_x, column_w, ctx)
 }
 
@@ -1144,6 +1374,18 @@ fn layout_node(
 
         // `{% swatch %}` — a block colour bar / chip (solid or gradient).
         "swatch" => layout_swatch(tag, x, width, ctx),
+
+        // `{% lightindicators /%}` — status-light legend (swatch grid).
+        "lightindicators" => layout_lightindicators(x, width, ctx),
+
+        // `{% noParaSpaceBox %}` — collapse inter-paragraph gaps (address /
+        // contact stacks in copyright).
+        "noParaSpaceBox" => layout_no_para_space_box(tag, x, width, ctx),
+
+        // `{% imagegrid %}` / `{% gridimage %}` — illustrated side-by-side
+        // cells on a light grey panel (Locomotion, etc.).
+        "imagegrid" => layout_imagegrid(tag, x, width, ctx),
+        "gridimage" => layout_gridimage(tag, x, width, ctx),
 
         // `{% qr %}` — a QR code from `value`.
         "qr" => layout_qr(tag, x, width, ctx),
@@ -1278,6 +1520,8 @@ fn build_caption_block(
         anchor_id: None,
 
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }
 }
 
@@ -1308,6 +1552,8 @@ fn caption_block_from_str(text: &str, x: f32, width: f32, ctx: &mut LayoutCtx<'_
         outline: None,
         anchor_id: None,
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }
 }
 
@@ -1500,7 +1746,8 @@ fn layout_paragraph(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> V
 
     let mut out = promoted;
 
-    let mut inlines = Inlines::from(&text_children, &mut ctx.footnotes);
+    let mut inlines =
+        Inlines::from_with_labels(&text_children, &mut ctx.footnotes, Some(ctx.crossref_labels));
     if inlines.text.trim().is_empty() {
         return out;
     }
@@ -1593,6 +1840,8 @@ fn layout_paragraph(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> V
         anchor_id: None,
 
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     });
     out
 }
@@ -1696,6 +1945,8 @@ pub fn build_toc_blocks(
             anchor_id: None,
 
             tag_role: None,
+            page_column: 0,
+            column_span: style.page_layout.columns > 1,
         });
     }
 
@@ -1742,6 +1993,8 @@ pub fn build_toc_blocks(
             anchor_id: None,
 
             tag_role: None,
+            page_column: 0,
+            column_span: style.page_layout.columns > 1,
         });
     }
 
@@ -1791,6 +2044,8 @@ pub fn build_list_section_blocks(
             anchor_id: None,
 
             tag_role: None,
+            page_column: 0,
+            column_span: style.page_layout.columns > 1,
         });
     }
 
@@ -1827,6 +2082,8 @@ pub fn build_list_section_blocks(
             anchor_id: None,
 
             tag_role: None,
+            page_column: 0,
+            column_span: style.page_layout.columns > 1,
         });
     }
     blocks
@@ -1851,6 +2108,8 @@ fn attr_is_false(t: &Tag, key: &str) -> bool {
 
 fn layout_heading(tag: &Tag, level: u8, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<Block> {
     let h = ctx.style.heading.for_level(level).clone();
+    let column_span = ctx.heading_spans_columns(level);
+    let lay_w = if column_span { ctx.body_full_width() } else { width };
 
     // Pull anchor declarations (`{% tag id="X" %}`) out of the heading's
     // children so the id is recorded on the resulting block. Returns
@@ -1914,7 +2173,7 @@ fn layout_heading(tag: &Tag, level: u8, x: f32, width: f32, ctx: &mut LayoutCtx<
         font_families: ctx.body_families,
         italic: false,
     };
-    let layout = build_layout(&text, &ranges, &style, width, ctx.font_cx, ctx.layout_cx);
+    let layout = build_layout(&text, &ranges, &style, lay_w, ctx.font_cx, ctx.layout_cx);
     let outline_text = text.clone();
     let slice = TextSlice::whole(layout, text, Vec::new(), x);
     let height = slice.height();
@@ -1935,6 +2194,8 @@ fn layout_heading(tag: &Tag, level: u8, x: f32, width: f32, ctx: &mut LayoutCtx<
         anchor_id: Some(resolved_anchor),
 
         tag_role: None,
+        page_column: 0,
+        column_span,
     });
     blocks
 }
@@ -2114,6 +2375,8 @@ fn layout_list(
             anchor_id: None,
 
             tag_role: None,
+            page_column: 0,
+            column_span: false,
         });
     }
 
@@ -2258,6 +2521,8 @@ fn layout_blockquote(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> 
         anchor_id: None,
 
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }]
 }
 
@@ -2336,6 +2601,8 @@ fn layout_code_block(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> 
         anchor_id: None,
 
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     };
 
     vec![Block {
@@ -2358,6 +2625,8 @@ fn layout_code_block(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> 
         anchor_id: None,
 
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }]
 }
 
@@ -2553,6 +2822,8 @@ fn layout_callout(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec
         anchor_id: None,
 
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }]
 }
 
@@ -2597,6 +2868,8 @@ fn build_callout_label_block(
         outline: None,
         anchor_id: None,
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }
 }
 
@@ -2616,6 +2889,8 @@ fn layout_rule(x: f32, width: f32, style: &Style) -> Block {
         anchor_id: None,
 
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }
 }
 
@@ -2639,6 +2914,8 @@ fn toc_marker_block(x: f32) -> Block {
         outline: None,
         anchor_id: Some(TOC_MARKER_ANCHOR.to_string()),
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }
 }
 
@@ -2651,6 +2928,8 @@ fn page_break_block() -> Block {
         outline: None,
         anchor_id: None,
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }
 }
 
@@ -2672,6 +2951,8 @@ fn spacer_block(height: f32) -> Block {
         anchor_id: None,
 
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }
 }
 
@@ -2971,6 +3252,8 @@ fn wrap_in_panel(inner: Vec<Block>, x: f32, width: f32, bg: rgb::Color, space_af
         outline: None,
         anchor_id: None,
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }
 }
 
@@ -3047,6 +3330,8 @@ fn atomic_group(inner: Vec<Block>, x: f32, width: f32, space_after: f32) -> Bloc
         outline: None,
         anchor_id: None,
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }
 }
 
@@ -3310,12 +3595,379 @@ fn layout_swatch(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<
             outline: None,
             anchor_id: None,
             tag_role: None,
+            page_column: 0,
+            column_span: false,
         }],
         Err(e) => {
             eprintln!("warning: swatch render failed — {e}");
             placeholder(x, width, ctx, "[swatch: render failed]")
         }
     }
+}
+
+/// One status-light entry — mirrors `components/LightIndicators.tsx` and
+/// the `.light-indicator-bar.*` fills in `public/globals.css`.
+struct LightIndicatorSpec {
+    title: &'static str,
+    description: &'static str,
+    /// Solid CSS colour, or `None` when `gradient` is set.
+    color: Option<&'static str>,
+    /// Swatch `gradient="…"` string (CSS-compatible stops), or `None`.
+    gradient: Option<&'static str>,
+}
+
+/// Status lights shown by `{% lightindicators /%}`. Colours / gradients
+/// match the web component's CSS classes.
+const LIGHT_INDICATORS: &[LightIndicatorSpec] = &[
+    LightIndicatorSpec {
+        title: "Red",
+        description: "Emergency stop or Protective stop",
+        color: Some("#ff0000"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Green",
+        description: "Ready for job",
+        color: Some("#00fa00"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Cyan",
+        description: "Drives to destination",
+        color: Some("#00fafa"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Purple",
+        description: "Goal/Path blocked",
+        color: Some("#f900f9"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Wavering white",
+        description: "Planning path",
+        color: None,
+        // CSS: linear-gradient(to right, white, black, white)
+        gradient: Some("90deg, white, black, white"),
+    },
+    LightIndicatorSpec {
+        title: "Orange",
+        description: "Mission paused",
+        color: Some("#fd7e14"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Wavering orange",
+        description: "Startup signal before PC is active",
+        color: None,
+        // CSS: linear-gradient(to right, #fd7e14, white, #fd7e14)
+        gradient: Some("90deg, #fd7e14, white, #fd7e14"),
+    },
+    LightIndicatorSpec {
+        title: "Fading orange",
+        description: "Shutting down robot",
+        color: None,
+        // CSS: linear-gradient(to bottom, #fd7e14, #fff3e0)
+        gradient: Some("180deg, #fd7e14, #fff3e0"),
+    },
+    LightIndicatorSpec {
+        title: "Blinking orange",
+        description: "Relative move, ignoring obstacles",
+        color: None,
+        // CSS uses repeating-linear-gradient; approximate one pulse period.
+        gradient: Some("90deg, transparent, #fd7e14 15%, #fd7e14 35%, transparent 50%"),
+    },
+    LightIndicatorSpec {
+        title: "Wavering purple and orange",
+        description: "General error",
+        color: None,
+        // CSS: linear-gradient(to right, #fd7e14, #a435f0, #fd7e14)
+        gradient: Some("90deg, #fd7e14, #a435f0, #fd7e14"),
+    },
+    LightIndicatorSpec {
+        title: "Blue",
+        description: "Manual drive",
+        color: Some("#0000ff"),
+        gradient: None,
+    },
+    LightIndicatorSpec {
+        title: "Wavering blue",
+        description: "Mapping",
+        color: None,
+        // CSS: linear-gradient(to right, #0000ff, white, #0000ff)
+        gradient: Some("90deg, #0000ff, white, #0000ff"),
+    },
+    LightIndicatorSpec {
+        title: "Battery percentage",
+        description: "Charging at charging station",
+        color: None,
+        // CSS: linear-gradient(to right, #ff0000, transparent 25%)
+        gradient: Some("90deg, #ff0000, transparent 25%"),
+    },
+    LightIndicatorSpec {
+        title: "Wavering cyan",
+        description: "Waiting for MiR Fleet resource or for another MiR robot to move",
+        color: None,
+        // CSS: linear-gradient(to right, #00fafa, white, #00fafa)
+        gradient: Some("90deg, #00fafa, white, #00fafa"),
+    },
+];
+
+/// Description text colour — matches `.light-indicator-description` in
+/// `public/globals.css` (`#6c757d`).
+const LIGHT_INDICATOR_DESC_COLOR: &str = "#6c757d";
+
+/// Bar height / radius — matches `.light-indicator-bar` (5px, 2px radius).
+const LIGHT_INDICATOR_BAR_HEIGHT: f64 = 5.0;
+const LIGHT_INDICATOR_BAR_RADIUS: f64 = 2.0;
+
+/// Grid metrics — matches `.light-indicator-grid`
+/// (`minmax(150px, 1fr)`, `gap: 1.25rem` ≈ 15pt).
+const LIGHT_INDICATOR_MIN: f64 = 150.0;
+const LIGHT_INDICATOR_GAP: f64 = 15.0;
+
+/// Build a trivial Markdoc render node.
+fn light_rt_tag(name: &str, attrs: std::collections::HashMap<String, Scalar>, children: Vec<RenderableTreeNode>) -> RenderableTreeNode {
+    RenderableTreeNode::Tag(Box::new(Tag {
+        name: name.to_string(),
+        attributes: attrs,
+        children,
+    }))
+}
+
+fn light_rt_text(s: &str) -> RenderableTreeNode {
+    RenderableTreeNode::Scalar(Scalar::String(s.to_string()))
+}
+
+/// One grid cell: `{% swatch %}` bar + bold title + grey description.
+/// Title and description share one paragraph (hard-break between) so the
+/// gap matches the web's tight `.light-indicator-title` / description stack
+/// rather than two full `paragraph_space_after` gaps.
+fn light_indicator_cell(spec: &LightIndicatorSpec) -> Vec<RenderableTreeNode> {
+    let mut swatch_attrs = std::collections::HashMap::new();
+    if let Some(g) = spec.gradient {
+        swatch_attrs.insert("gradient".to_string(), Scalar::String(g.to_string()));
+    } else if let Some(c) = spec.color {
+        swatch_attrs.insert("color".to_string(), Scalar::String(c.to_string()));
+    }
+    swatch_attrs.insert(
+        "height".to_string(),
+        Scalar::Number(LIGHT_INDICATOR_BAR_HEIGHT),
+    );
+    swatch_attrs.insert(
+        "radius".to_string(),
+        Scalar::Number(LIGHT_INDICATOR_BAR_RADIUS),
+    );
+
+    let mut color_attrs = std::collections::HashMap::new();
+    color_attrs.insert(
+        "value".to_string(),
+        Scalar::String(LIGHT_INDICATOR_DESC_COLOR.to_string()),
+    );
+
+    let label = light_rt_tag(
+        "p",
+        std::collections::HashMap::new(),
+        vec![
+            light_rt_tag(
+                "strong",
+                std::collections::HashMap::new(),
+                vec![light_rt_text(spec.title)],
+            ),
+            light_rt_tag("hardbreak", std::collections::HashMap::new(), Vec::new()),
+            light_rt_tag(
+                "color",
+                color_attrs,
+                vec![light_rt_text(spec.description)],
+            ),
+        ],
+    );
+
+    vec![light_rt_tag("swatch", swatch_attrs, Vec::new()), label]
+}
+
+/// `{% lightindicators /%}` — status-light legend. Expands into a `{% grid %}`
+/// of `{% swatch %}` bars with bold titles and muted descriptions, using the
+/// same colours / gradients as the web `LightIndicators` component.
+fn layout_lightindicators(x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<Block> {
+    let items: Vec<RenderableTreeNode> = LIGHT_INDICATORS
+        .iter()
+        .map(|spec| {
+            light_rt_tag(
+                "li",
+                std::collections::HashMap::new(),
+                light_indicator_cell(spec),
+            )
+        })
+        .collect();
+
+    let ul = light_rt_tag("ul", std::collections::HashMap::new(), items);
+
+    let mut grid_attrs = std::collections::HashMap::new();
+    grid_attrs.insert("min".to_string(), Scalar::Number(LIGHT_INDICATOR_MIN));
+    grid_attrs.insert("gap".to_string(), Scalar::Number(LIGHT_INDICATOR_GAP));
+
+    let grid = Tag {
+        name: "grid".to_string(),
+        attributes: grid_attrs,
+        children: vec![ul],
+    };
+    let mut blocks = layout_grid(&grid, x, width, ctx);
+    // Match `.light-indicator-grid { margin: 1.25rem 0 }` — keep a bit of
+    // breathing room after the legend before the next section prose.
+    if let Some(last) = blocks.last_mut() {
+        last.space_after = LIGHT_INDICATOR_GAP as f32;
+    }
+    blocks
+}
+
+/// Outer margin of `{% noParaSpaceBox %}` — matches `.noParaSpaceBox {
+/// margin: 15px 0 }` in `public/globals.css` (15 CSS px ≈ 11 pt).
+const NO_PARA_SPACE_BOX_MARGIN: f32 = 11.0;
+
+/// `{% noParaSpaceBox %}…{% /noParaSpaceBox %}` — lay children out normally,
+/// then collapse every inter-paragraph `space_after` to zero so address /
+/// contact lines stack as tightly as the web `.noParaSpaceBox p { margin: 0 }`
+/// rule. The box itself keeps a small trailing margin (CSS `15px`).
+fn layout_no_para_space_box(
+    tag: &Tag,
+    x: f32,
+    width: f32,
+    ctx: &mut LayoutCtx<'_>,
+) -> Vec<Block> {
+    // Skip blank / whitespace-only children so a leading blank line after the
+    // opening tag doesn't leave an empty gap at the top of the stack.
+    let children: Vec<&RenderableTreeNode> = tag
+        .children
+        .iter()
+        .filter(|c| match c {
+            RenderableTreeNode::Tag(t) => !node_text_is_blank(&t.children),
+            RenderableTreeNode::Scalar(Scalar::String(s)) => !s.trim().is_empty(),
+            RenderableTreeNode::Scalar(_) => true,
+        })
+        .collect();
+
+    let mut blocks = Vec::new();
+    for child in children {
+        blocks.extend(layout_node(child, x, width, ctx));
+    }
+    if blocks.is_empty() {
+        return blocks;
+    }
+    let last = blocks.len() - 1;
+    for (i, b) in blocks.iter_mut().enumerate() {
+        b.space_after = if i == last {
+            NO_PARA_SPACE_BOX_MARGIN
+        } else {
+            0.0
+        };
+    }
+    blocks
+}
+
+/// Light grey panel behind `{% imagegrid %}` — matches `.imagegrid {
+/// background-color: #f9f9f9 }` in `public/globals.css`.
+const IMAGE_GRID_BG: &str = "#f9f9f9";
+
+/// Column gutter inside an image grid — matches `.imagegrid { gap: 10px }`.
+const IMAGE_GRID_GAP: f32 = 10.0;
+
+/// String attribute helper for gridimage / imagegrid layout.
+fn attr_string<'a>(
+    attrs: &'a std::collections::HashMap<String, Scalar>,
+    key: &str,
+) -> Option<&'a str> {
+    match attrs.get(key) {
+        Some(Scalar::String(s)) if !s.trim().is_empty() => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// Expand one `{% gridimage %}` into the column contents: media + bold
+/// headline + body paragraph (mirrors `MarkdocGridImage` on the web).
+fn gridimage_cell_nodes(tag: &Tag) -> Vec<RenderableTreeNode> {
+    let mut nodes = Vec::new();
+
+    let mut media_attrs = std::collections::HashMap::new();
+    if let Some(id) = attr_string(&tag.attributes, "id") {
+        media_attrs.insert("id".to_string(), Scalar::String(id.to_string()));
+    }
+    if let Some(alt) = attr_string(&tag.attributes, "alt") {
+        media_attrs.insert("alt".to_string(), Scalar::String(alt.to_string()));
+    }
+    // Fill the column — the locomotion examples are the main visual.
+    media_attrs.insert("size".to_string(), Scalar::String("large".to_string()));
+    nodes.push(light_rt_tag("media", media_attrs, Vec::new()));
+
+    if let Some(headline) = attr_string(&tag.attributes, "headline") {
+        nodes.push(light_rt_tag(
+            "p",
+            std::collections::HashMap::new(),
+            vec![light_rt_tag(
+                "strong",
+                std::collections::HashMap::new(),
+                vec![light_rt_text(headline)],
+            )],
+        ));
+    }
+
+    if let Some(body) = attr_string(&tag.attributes, "bodytext") {
+        nodes.push(light_rt_tag(
+            "p",
+            std::collections::HashMap::new(),
+            vec![light_rt_text(body)],
+        ));
+    }
+
+    nodes
+}
+
+/// `{% imagegrid %}…{% /imagegrid %}` — equal columns of `{% gridimage %}`
+/// cells on a light grey panel (Locomotion example, etc.).
+fn layout_imagegrid(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<Block> {
+    let cells: Vec<Vec<RenderableTreeNode>> = tag
+        .children
+        .iter()
+        .filter_map(|c| match c {
+            RenderableTreeNode::Tag(t) if t.name == "gridimage" => Some(gridimage_cell_nodes(t)),
+            _ => None,
+        })
+        .collect();
+
+    if cells.is_empty() {
+        // No gridimage children — fall back to laying out whatever is inside
+        // so content is not silently dropped.
+        return layout_children(&tag.children, x, width, ctx);
+    }
+
+    let bg = super::inline::parse_css_color(IMAGE_GRID_BG).unwrap_or_else(|| {
+        rgb::Color::new(0xF9, 0xF9, 0xF9)
+    });
+    let inner_x = x + PANEL_PAD;
+    let inner_w = width - 2.0 * PANEL_PAD;
+    let row = layout_cells_row(
+        cells,
+        inner_x,
+        inner_w,
+        IMAGE_GRID_GAP,
+        None,
+        None,
+        ctx,
+    );
+    vec![wrap_in_panel(
+        row,
+        x,
+        width,
+        bg,
+        ctx.style.paragraph_space_after,
+    )]
+}
+
+/// Standalone `{% gridimage %}` (outside an imagegrid) — stack media +
+/// headline + body at full column width, no grey panel.
+fn layout_gridimage(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<Block> {
+    let nodes = gridimage_cell_nodes(tag);
+    layout_children(&nodes, x, width, ctx)
 }
 
 /// Build an SVG for a QR `code`: a `light` field with every dark module a
@@ -3424,6 +4076,8 @@ fn layout_qr(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<Bloc
             outline: None,
             anchor_id: None,
             tag_role: None,
+            page_column: 0,
+            column_span: false,
         }],
         Err(e) => {
             eprintln!("warning: qr render failed — {e}");
@@ -3514,7 +4168,8 @@ fn layout_paragraph_float(
     let RenderableTreeNode::Tag(tag) = node else {
         return Vec::new();
     };
-    let mut inlines = Inlines::from(&tag.children, &mut ctx.footnotes);
+    let mut inlines =
+        Inlines::from_with_labels(&tag.children, &mut ctx.footnotes, Some(ctx.crossref_labels));
     if inlines.text.trim().is_empty() {
         return Vec::new();
     }
@@ -3598,6 +4253,8 @@ fn layout_paragraph_float(
         outline: None,
         anchor_id: None,
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }]
 }
 
@@ -3749,6 +4406,8 @@ fn layout_float(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<B
         outline: None,
         anchor_id: None,
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }]
 }
 
@@ -3825,7 +4484,11 @@ fn flatten_anchored(
                     anchors.push((ib.text.len(), (**t).clone()));
                 }
                 other => {
-                    let sub = Inlines::from(std::slice::from_ref(other), &mut ctx.footnotes);
+                    let sub = Inlines::from_with_labels(
+                        std::slice::from_ref(other),
+                        &mut ctx.footnotes,
+                        Some(ctx.crossref_labels),
+                    );
                     append_inlines(ib, sub);
                 }
             }
@@ -3850,7 +4513,11 @@ fn flatten_anchored(
                 if !ib.text.is_empty() {
                     ib.text.push_str("\n\n");
                 }
-                let sub = Inlines::from(std::slice::from_ref(other), &mut ctx.footnotes);
+                let sub = Inlines::from_with_labels(
+                    std::slice::from_ref(other),
+                    &mut ctx.footnotes,
+                    Some(ctx.crossref_labels),
+                );
                 append_inlines(&mut ib, sub);
             }
         }
@@ -4007,6 +4674,8 @@ fn layout_float_anchored(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>)
         outline: None,
         anchor_id: None,
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }]
 }
 
@@ -4166,10 +4835,14 @@ fn layout_input(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<B
         outline: None,
         anchor_id: None,
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }]
 }
 
 fn layout_table(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<Block> {
+    let column_span = ctx.page_columns() > 1;
+    let lay_w = if column_span { ctx.body_full_width() } else { width };
     // Per-table style overrides from the `{% table … %}` attributes; a
     // plain pipe table has none, so everything inherits the document style.
     let ov = TableOverride::from_attrs(&tag.attributes);
@@ -4237,7 +4910,7 @@ fn layout_table(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<B
     let padding = ov.cell_padding.unwrap_or(ctx.style.table_cell_padding);
     let border_thickness = ctx.style.table_border_thickness;
     let total_borders = border_thickness * (num_cols as f32 + 1.0);
-    let inner_width = width - total_borders;
+    let inner_width = lay_w - total_borders;
 
     // Decide column widths. Explicit weights win when they match this
     // table's column count; otherwise fall back to the automatic modes.
@@ -4376,6 +5049,8 @@ fn layout_table(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<B
         outline: None,
         anchor_id: Some(format!("__table_{table_id}")),
         tag_role: None,
+        page_column: 0,
+        column_span,
     }]
 }
 
@@ -4848,16 +5523,16 @@ fn layout_media(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<B
 
     // `size` keyword scales the display width relative to the space available
     // here (a column, a table cell, …): small = 50 %, medium = 75 %, large =
-    // 100 % (the default). `fit_size` never upscales, so a small source image
-    // still renders at its natural size. (Explicit `width` is a float-only
-    // knob; `size` is the general one.)
+    // 100 %. The default (no attribute) is 75 %. `fit_size` never upscales,
+    // so a small source image still renders at its natural size.
     let avail = match tag.attributes.get("size") {
         Some(Scalar::String(s)) => match s.trim() {
             "small" => width * 0.5,
             "medium" => width * 0.75,
-            _ => width, // "large" or anything unrecognised → full width
+            "large" => width,
+            _ => width * 0.75,
         },
-        _ => width,
+        _ => width * 0.75,
     };
 
     // Fetch the first candidate that resolves. A missing file fails the
@@ -4950,6 +5625,8 @@ fn layout_media(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<B
                 outline: None,
                 anchor_id: Some(format!("__figure_{figure_id}")),
                 tag_role: None,
+                page_column: 0,
+                column_span: false,
             };
             let visible = if had_caption_tag { None } else { caption_attr };
             finish_media(block, visible, x, width, ctx)
@@ -4985,6 +5662,8 @@ fn layout_media(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<B
                         outline: None,
                         anchor_id: Some(format!("__figure_{figure_id}")),
                         tag_role: None,
+                        page_column: 0,
+                        column_span: false,
                     };
                     let visible = if had_caption_tag { None } else { caption_attr };
                     finish_media(block, visible, x, width, ctx)
@@ -5053,6 +5732,8 @@ fn placeholder(x: f32, width: f32, ctx: &mut LayoutCtx<'_>, message: &str) -> Ve
         anchor_id: None,
 
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }]
 }
 
@@ -5067,7 +5748,11 @@ fn layout_table_cell_paragraph(
     // Table cells don't carry document footnotes for v1 — the
     // pagination pool only attaches to top-level body blocks, so
     // routing cell footnotes there could end up on the wrong page.
-    let inlines = Inlines::from(&cell.children, &mut Vec::new());
+    let inlines = Inlines::from_with_labels(
+        &cell.children,
+        &mut Vec::new(),
+        Some(ctx.crossref_labels),
+    );
     if inlines.text.trim().is_empty() {
         return Vec::new();
     }
@@ -5103,6 +5788,8 @@ fn layout_table_cell_paragraph(
         anchor_id: None,
 
         tag_role: None,
+        page_column: 0,
+        column_span: false,
     }]
 }
 
