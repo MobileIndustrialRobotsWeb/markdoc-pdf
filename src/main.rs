@@ -243,9 +243,9 @@ fn run(args: &Args) -> Result<(), AppError> {
 
     // Expose the document's own frontmatter as template variables for
     // header/footer and cover-page templates (`{version}`, `{language}`,
-    // … — whatever the author wrote). The renderer stays domain-agnostic:
-    // every scalar frontmatter field is surfaced under its authored key,
-    // with no hard-coded field names here. Unset fields simply never
+    // `{products}`, … — whatever the author wrote). The renderer stays
+    // domain-agnostic: every scalar (or flat list of scalars, joined with
+    // ", ") is surfaced under its authored key. Unset fields simply never
     // appear, so their `{name}` token stays literal (and detail lines
     // that resolve to nothing are skipped).
     let mut vars: HashMap<String, String> = HashMap::new();
@@ -430,11 +430,13 @@ fn json_to_scalar(value: &serde_json::Value) -> Scalar {
 }
 
 /// Surface every scalar frontmatter field as a template variable keyed
-/// by its authored name. Nested values (arrays / objects) and empty
-/// strings are skipped — they have no single sensible string form. The
-/// renderer never sees the field *names*, so it stays domain-agnostic:
-/// whatever the document declares (`version`, `language`, a custom
-/// `productLine`, …) becomes referenceable as `{name}`.
+/// by its authored name. Arrays of scalars are joined with `", "` (so
+/// `{orderNumber}` / `{products}` render as a single value or a
+/// comma-separated list). Nested objects, empty arrays, and empty
+/// strings are skipped. The renderer never sees the field *names*, so
+/// it stays domain-agnostic: whatever the document declares
+/// (`version`, `language`, a custom `productLine`, …) becomes
+/// referenceable as `{name}`.
 fn collect_frontmatter_vars(doc: &markdoc::ast::Node, vars: &mut HashMap<String, String>) {
     let Some(Scalar::Object(map)) = doc.attributes.get("frontmatter") else {
         return;
@@ -447,8 +449,9 @@ fn collect_frontmatter_vars(doc: &markdoc::ast::Node, vars: &mut HashMap<String,
 }
 
 /// Render a scalar as a flat template string. Whole-number floats print
-/// without a fractional part (YAML integers arrive as `f64`). Non-scalar
-/// or empty values yield `None`.
+/// without a fractional part (YAML integers arrive as `f64`). Arrays of
+/// scalars join with `", "`. Objects, nested arrays, null, and empty
+/// values yield `None`.
 fn scalar_to_template_string(value: &Scalar) -> Option<String> {
     match value {
         Scalar::String(s) if !s.trim().is_empty() => Some(s.clone()),
@@ -456,7 +459,26 @@ fn scalar_to_template_string(value: &Scalar) -> Option<String> {
         Scalar::Number(n) if n.is_finite() && n.fract() == 0.0 => Some(format!("{}", *n as i64)),
         Scalar::Number(n) => Some(n.to_string()),
         Scalar::Boolean(b) => Some(b.to_string()),
-        Scalar::Null | Scalar::Array(_) | Scalar::Object(_) => None,
+        Scalar::Array(items) => {
+            // Only flat lists of scalars (e.g. `products`, `orderNumber`).
+            // `documentHistory` (array of objects) stays out of templates.
+            if items
+                .iter()
+                .any(|item| matches!(item, Scalar::Array(_) | Scalar::Object(_)))
+            {
+                return None;
+            }
+            let parts: Vec<String> = items
+                .iter()
+                .filter_map(scalar_to_template_string)
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(", "))
+            }
+        }
+        Scalar::Null | Scalar::Object(_) => None,
     }
 }
 
@@ -605,6 +627,39 @@ mod tests {
         assert_eq!(
             scalar_to_template_string(&Scalar::Object(std::collections::HashMap::new())),
             None
+        );
+        // Arrays of objects (e.g. documentHistory) are not flattened.
+        assert_eq!(
+            scalar_to_template_string(&Scalar::Array(vec![Scalar::Object(
+                std::collections::HashMap::new()
+            )])),
+            None
+        );
+    }
+
+    #[test]
+    fn scalar_arrays_join_with_comma() {
+        assert_eq!(
+            scalar_to_template_string(&Scalar::Array(vec![Scalar::String("MiR250".into())]))
+                .as_deref(),
+            Some("MiR250")
+        );
+        assert_eq!(
+            scalar_to_template_string(&Scalar::Array(vec![
+                Scalar::String("MiR250".into()),
+                Scalar::String("MiR600".into()),
+            ]))
+            .as_deref(),
+            Some("MiR250, MiR600")
+        );
+        // YAML integers in orderNumber lists.
+        assert_eq!(
+            scalar_to_template_string(&Scalar::Array(vec![
+                Scalar::Number(450314.0),
+                Scalar::Number(450315.0),
+            ]))
+            .as_deref(),
+            Some("450314, 450315")
         );
     }
 

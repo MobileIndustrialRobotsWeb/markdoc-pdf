@@ -1462,6 +1462,28 @@ fn layout_children(
             i += 2;
             continue;
         }
+
+        // Consecutive size="small" images (or `<p>` wrappers that hold
+        // only one) share a row — same look as the web inline-block
+        // pairing used in spare-part procedures.
+        if let Some(first) = small_media_tag(&children[i]) {
+            let mut run: Vec<&Tag> = vec![first];
+            let mut j = i + 1;
+            while j < children.len() {
+                if let Some(next) = small_media_tag(&children[j]) {
+                    run.push(next);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if run.len() >= 2 {
+                out.extend(layout_small_media_row(&run, x, width, ctx));
+                i = j;
+                continue;
+            }
+        }
+
         out.extend(layout_node(&children[i], x, width, ctx));
         i += 1;
     }
@@ -1723,26 +1745,51 @@ fn layout_paragraph(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> V
     // flow as a normal paragraph.
     let mut promoted: Vec<Block> = Vec::new();
     let mut text_children: Vec<RenderableTreeNode> = Vec::new();
+    let mut media_run: Vec<&Tag> = Vec::new();
+
+    let flush_media_run = |run: &mut Vec<&Tag>, out: &mut Vec<Block>, ctx: &mut LayoutCtx<'_>| {
+        if run.is_empty() {
+            return;
+        }
+        if run.len() >= 2 && run.iter().all(|t| media_is_small(t)) {
+            out.extend(layout_small_media_row(run, x, width, ctx));
+        } else {
+            for t in run.iter() {
+                out.extend(layout_media(t, x, width, ctx));
+            }
+        }
+        run.clear();
+    };
+
     for child in &tag.children {
         if let RenderableTreeNode::Tag(t) = child {
             match t.name.as_str() {
                 "img" | "media" => {
-                    promoted.extend(layout_media(t, x, width, ctx));
+                    if media_is_small(t) {
+                        media_run.push(t);
+                    } else {
+                        flush_media_run(&mut media_run, &mut promoted, ctx);
+                        promoted.extend(layout_media(t, x, width, ctx));
+                    }
                     continue;
                 }
                 "callout" => {
+                    flush_media_run(&mut media_run, &mut promoted, ctx);
                     promoted.extend(layout_callout(t, x, width, ctx));
                     continue;
                 }
                 "input" => {
+                    flush_media_run(&mut media_run, &mut promoted, ctx);
                     promoted.extend(layout_input(t, x, width, ctx));
                     continue;
                 }
                 _ => {}
             }
         }
+        flush_media_run(&mut media_run, &mut promoted, ctx);
         text_children.push(child.clone());
     }
+    flush_media_run(&mut media_run, &mut promoted, ctx);
 
     let mut out = promoted;
 
@@ -5353,7 +5400,86 @@ fn layout_cell_content(
 
 // ── Media (img / media) ─────────────────────────────────────────────────
 
+/// Horizontal inset applied to every image, matching the web `5px` L/R
+/// padding on `{% image %}`.
+const IMAGE_H_PAD: f32 = 5.0;
+
+fn media_is_small(tag: &Tag) -> bool {
+    matches!(
+        tag.attributes.get("size"),
+        Some(Scalar::String(s)) if s.trim() == "small"
+    )
+}
+
+/// A direct `<img>`/`<media size="small">`, or a `<p>` whose only media
+/// child is small — the shape Markdoc produces for a lone image tag on
+/// its own line under a list item.
+fn small_media_tag(node: &RenderableTreeNode) -> Option<&Tag> {
+    match node {
+        RenderableTreeNode::Tag(t) if t.name == "img" || t.name == "media" => {
+            media_is_small(t).then_some(t.as_ref())
+        }
+        RenderableTreeNode::Tag(t) if t.name == "p" => {
+            let mut media: Option<&Tag> = None;
+            for child in &t.children {
+                match child {
+                    RenderableTreeNode::Tag(inner)
+                        if inner.name == "img" || inner.name == "media" =>
+                    {
+                        if media.is_some() {
+                            return None;
+                        }
+                        media = Some(inner.as_ref());
+                    }
+                    RenderableTreeNode::Scalar(Scalar::String(s)) if s.trim().is_empty() => {}
+                    RenderableTreeNode::Scalar(Scalar::Null) => {}
+                    _ => return None,
+                }
+            }
+            media.filter(|m| media_is_small(m))
+        }
+        _ => None,
+    }
+}
+
+/// Place two or more `size="small"` images on one row (borderless equal
+/// columns), kept atomic so pagination never splits the pair.
+///
+/// Each tag keeps `size="small"` in the source for web pairing, but once
+/// the row already splits the column in half we fill each cell (override
+/// to `large`) — otherwise `small` × half-column ≈ 25 % page width and a
+/// large gutter appears between the pair.
+fn layout_small_media_row(
+    tags: &[&Tag],
+    x: f32,
+    width: f32,
+    ctx: &mut LayoutCtx<'_>,
+) -> Vec<Block> {
+    use parley::layout::Alignment;
+    let cells: Vec<Vec<RenderableTreeNode>> = tags
+        .iter()
+        .map(|t| {
+            let mut cell_tag = (*t).clone();
+            cell_tag.attributes.insert(
+                "size".to_string(),
+                Scalar::String("large".to_string()),
+            );
+            vec![RenderableTreeNode::Tag(Box::new(cell_tag))]
+        })
+        .collect();
+    let rows = layout_cells_row(cells, x, width, 0.0, None, Some(Alignment::Center), ctx);
+    vec![atomic_group(
+        rows,
+        x,
+        width,
+        ctx.style.paragraph_space_after,
+    )]
+}
+
 fn layout_media(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<Block> {
+    // Inset every image by IMAGE_H_PAD on both sides (web 5px L/R padding).
+    let x = x + IMAGE_H_PAD;
+    let width = (width - 2.0 * IMAGE_H_PAD).max(0.0);
     // Source resolution. Either an explicit `src` (markdown `![]()` or
     // `{% media src=… %}`), or an Arca `id` (`{% media id="<uuid>" /%}`).
     // In production Scriptor rewrites `id` to a concrete `src` before this
