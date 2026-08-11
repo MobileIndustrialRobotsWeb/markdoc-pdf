@@ -1756,44 +1756,7 @@ fn layout_paragraph(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> V
     // restyles the underlying glyphs. Done before hyphenation: links
     // pin the byte ranges anyway, so the soft-hyphen guard below
     // already skips paragraphs that contain any link.
-    let link_style = &ctx.style.link;
-    let link_color: krilla::color::rgb::Color = link_style.color.into();
-    for link in &inlines.links {
-        inlines.style_ranges.push(InlineRange {
-            start: link.start,
-            end: link.end,
-            prop: InlineProp::Color(link_color),
-        });
-        if link_style.italic {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Italic,
-            });
-        }
-        if link_style.bold {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Bold,
-            });
-        }
-    }
-    // Express the link underline as a parley decoration over the link's
-    // byte range, so the unified decoration pass draws it. Skipped when the
-    // style disables underlining; the colour follows the link text tint
-    // pushed above.
-    if link_style.underline {
-        for link in &inlines.links {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Underline {
-                    thickness: link_style.underline_thickness,
-                },
-            });
-        }
-    }
+    apply_link_style(&mut inlines, &ctx.style.link);
     // Hyphenate plain paragraphs only — inline ranges, links, anchors
     // and footnote calls all key on byte offsets, and inserting soft
     // hyphens shifts those, so we skip the pass when any are present.
@@ -4174,40 +4137,7 @@ fn layout_paragraph_float(
         return Vec::new();
     }
     // Link text styling — identical to `layout_paragraph`.
-    let link_style = &ctx.style.link;
-    let link_color: krilla::color::rgb::Color = link_style.color.into();
-    for link in &inlines.links {
-        inlines.style_ranges.push(InlineRange {
-            start: link.start,
-            end: link.end,
-            prop: InlineProp::Color(link_color),
-        });
-        if link_style.italic {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Italic,
-            });
-        }
-        if link_style.bold {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Bold,
-            });
-        }
-    }
-    if link_style.underline {
-        for link in &inlines.links {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Underline {
-                    thickness: link_style.underline_thickness,
-                },
-            });
-        }
-    }
+    apply_link_style(&mut inlines, &ctx.style.link);
     // Hyphenate only when nothing keys on byte offsets (same guard as
     // `layout_paragraph`) — helps fill the narrow lines beside the image.
     if let Some(h) = ctx.hyphenator
@@ -4583,40 +4513,7 @@ fn layout_float_anchored(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>)
     }
 
     // Link text styling (colour / weight / underline), as paragraphs do.
-    let link_style = &ctx.style.link;
-    let link_color: krilla::color::rgb::Color = link_style.color.into();
-    for link in &inlines.links {
-        inlines.style_ranges.push(InlineRange {
-            start: link.start,
-            end: link.end,
-            prop: InlineProp::Color(link_color),
-        });
-        if link_style.italic {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Italic,
-            });
-        }
-        if link_style.bold {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Bold,
-            });
-        }
-    }
-    if link_style.underline {
-        for link in &inlines.links {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Underline {
-                    thickness: link_style.underline_thickness,
-                },
-            });
-        }
-    }
+    apply_link_style(&mut inlines, &ctx.style.link);
     // No hyphenation here: it would insert soft hyphens and shift the float
     // anchor byte offsets recorded above.
 
@@ -5748,7 +5645,7 @@ fn layout_table_cell_paragraph(
     // Table cells don't carry document footnotes for v1 — the
     // pagination pool only attaches to top-level body blocks, so
     // routing cell footnotes there could end up on the wrong page.
-    let inlines = Inlines::from_with_labels(
+    let mut inlines = Inlines::from_with_labels(
         &cell.children,
         &mut Vec::new(),
         Some(ctx.crossref_labels),
@@ -5756,6 +5653,9 @@ fn layout_table_cell_paragraph(
     if inlines.text.trim().is_empty() {
         return Vec::new();
     }
+    // Same link colour / weight / underline as body paragraphs so
+    // `{% tagref %}` and markdown links stay visually distinct in cells.
+    apply_link_style(&mut inlines, &ctx.style.link);
     let (weight, color) = if is_header {
         (700.0, ctx.style.table_header_text_color.into())
     } else {
@@ -5791,6 +5691,45 @@ fn layout_table_cell_paragraph(
         page_column: 0,
         column_span: false,
     }]
+}
+
+/// Tint / weight / underline every link range on `inlines` from the
+/// document's `[link]` style. Shared by paragraphs, floats, and table
+/// cells so `{% tagref %}` looks the same in every context.
+fn apply_link_style(inlines: &mut Inlines, link_style: &super::style::LinkStyle) {
+    let link_color: krilla::color::rgb::Color = link_style.color.into();
+    for link in &inlines.links {
+        inlines.style_ranges.push(InlineRange {
+            start: link.start,
+            end: link.end,
+            prop: InlineProp::Color(link_color),
+        });
+        if link_style.italic {
+            inlines.style_ranges.push(InlineRange {
+                start: link.start,
+                end: link.end,
+                prop: InlineProp::Italic,
+            });
+        }
+        if link_style.bold {
+            inlines.style_ranges.push(InlineRange {
+                start: link.start,
+                end: link.end,
+                prop: InlineProp::Bold,
+            });
+        }
+    }
+    if link_style.underline {
+        for link in &inlines.links {
+            inlines.style_ranges.push(InlineRange {
+                start: link.start,
+                end: link.end,
+                prop: InlineProp::Underline {
+                    thickness: link_style.underline_thickness,
+                },
+            });
+        }
+    }
 }
 
 #[cfg(test)]
