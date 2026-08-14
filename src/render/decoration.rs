@@ -638,6 +638,7 @@ pub fn emit_watermark(
                 width: img.width,
                 height: img.height,
                 gap: 0.0,
+                ..Default::default()
             };
             let entry = media_cache
                 .entry(img.src.clone())

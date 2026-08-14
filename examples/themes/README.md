@@ -407,7 +407,8 @@ Used by `logo_left`/`logo_center`/`logo_right`, `[coverpage.logo]`,
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `…src` | string | `""` | Asset URI (`file://`, relative path, `https://`, `arca://`). |
+| `…id` | string (template) | `""` | Asset-library GUID (file stem), same as `{% media id="…" /%}`. Tried before `src`. |
+| `…src` | string (template) | `""` | Asset URI (`file://`, relative path, `https://`, `arca://`). A bare GUID with no extension is treated as an `id`. |
 | `…width` | number (pt) | `0.0` | Display width (no auto-scaling). |
 | `…height` | number (pt) | `0.0` | Display height. |
 | `…gap` | number (pt) | `6.0` | Gap between logo and slot text (LEFT/RIGHT header/footer slots only). |

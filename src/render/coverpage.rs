@@ -220,8 +220,9 @@ pub fn build_coverpage_blocks(
 
     // Optional hero image (e.g. a product photo) below the metadata. Drawn
     // from its own slot so a cover can carry both a brand logo (above the
-    // title) and a hero image. Same `{title}` / frontmatter substitution
-    // as detail lines so one style can serve every product manual.
+    // title) and a hero image. `id` / `src` use the same `{title}` /
+    // frontmatter substitution as detail lines so one style can serve every
+    // product manual (`id = "{coverImage}"` or `src = "{title}.png"`).
     if let Some(hero) = &coverpage.hero
         && let Some(block) = build_logo_block(
             hero,
@@ -441,8 +442,8 @@ fn cover_text_block(
 /// Decode the configured logo via the asset resolver and return a
 /// centred Image (raster) or Svg block. Width/height come from the
 /// `LogoSpec`; horizontal position is centred in the body column.
-/// `src` supports the same `{title}` / frontmatter templates as cover
-/// text so hero art can be selected per document.
+/// `id` / `src` support the same `{title}` / frontmatter templates as
+/// cover text so hero art can be selected per document.
 fn build_logo_block(
     logo: &super::style::LogoSpec,
     body_left: f32,
@@ -452,11 +453,10 @@ fn build_logo_block(
     render_ctx: &RenderContext,
     date_str: &str,
 ) -> Option<Block> {
-    let src = substitute(&logo.src, render_ctx, date_str);
-    if src.is_empty() || logo.width <= 0.0 || logo.height <= 0.0 {
+    if logo.width <= 0.0 || logo.height <= 0.0 {
         return None;
     }
-    let bytes = assets.fetch(&src).ok()?;
+    let bytes = fetch_logo_bytes(logo, assets, render_ctx, date_str)?;
     let format = sniff_format(&bytes);
     let x = cover_image_x(body_left, column_w, logo.width, align);
     let block = match format {
@@ -517,6 +517,64 @@ fn cover_image_x(body_left: f32, column_w: f32, width: f32, align: CoverAlign) -
     }
 }
 
+/// Load cover/logo bytes. `id` (asset-library GUID) is tried first, then
+/// `src` as a path, then `src` as a bare GUID. Unresolved `{templates}`
+/// are skipped so `id = "{coverImage}"` can fall back to `src`.
+fn fetch_logo_bytes(
+    logo: &super::style::LogoSpec,
+    assets: &dyn AssetResolver,
+    render_ctx: &RenderContext,
+    date_str: &str,
+) -> Option<Vec<u8>> {
+    let id = resolved_template(&substitute(&logo.id, render_ctx, date_str));
+    if !id.is_empty()
+        && let Some(bytes) = fetch_by_asset_id(assets, &id)
+    {
+        return Some(bytes);
+    }
+    let src = resolved_template(&substitute(&logo.src, render_ctx, date_str));
+    if src.is_empty() {
+        return None;
+    }
+    if let Ok(bytes) = assets.fetch(&src) {
+        return Some(bytes);
+    }
+    if looks_like_asset_id(&src) {
+        return fetch_by_asset_id(assets, &src);
+    }
+    None
+}
+
+fn resolved_template(value: &str) -> String {
+    if value.contains('{') {
+        String::new()
+    } else {
+        value.to_string()
+    }
+}
+
+fn looks_like_asset_id(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains('/')
+        && !value.contains('\\')
+        && std::path::Path::new(value).extension().is_none()
+}
+
+fn fetch_by_asset_id(assets: &dyn AssetResolver, id: &str) -> Option<Vec<u8>> {
+    const EXTS: [&str; 6] = ["webp", "png", "jpg", "jpeg", "gif", "svg"];
+    for ext in EXTS {
+        if let Ok(bytes) = assets.fetch(&format!("{id}.{ext}")) {
+            return Some(bytes);
+        }
+    }
+    if let Some(path) = assets.resolve_id(id)
+        && let Ok(bytes) = assets.fetch(&path)
+    {
+        return Some(bytes);
+    }
+    assets.fetch(id).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,5 +613,80 @@ mod tests {
             substitute("{productImage}.png", &ctx, ""),
             "MiR250 Hook Manual.png"
         );
+    }
+
+    #[test]
+    fn unresolved_cover_image_template_is_skipped() {
+        assert_eq!(resolved_template("{coverImage}"), "");
+        assert_eq!(
+            resolved_template("09f3a884-2e34-4821-81ef-2935a85a7477"),
+            "09f3a884-2e34-4821-81ef-2935a85a7477"
+        );
+    }
+
+    #[test]
+    fn bare_guid_looks_like_asset_id() {
+        assert!(looks_like_asset_id("09f3a884-2e34-4821-81ef-2935a85a7477"));
+        assert!(!looks_like_asset_id("MiR250 Manual.png"));
+        assert!(!looks_like_asset_id("images/hero.webp"));
+    }
+
+    #[test]
+    fn hero_id_loads_asset_library_file() {
+        use super::super::style::LogoSpec;
+        use crate::assets::FsAssetResolver;
+
+        let base = std::env::temp_dir().join("mdpdf-cover-id-test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let id = "09f3a884-2e34-4821-81ef-2935a85a7477";
+        std::fs::write(base.join(format!("{id}.webp")), b"RIFF....WEBP").unwrap();
+
+        let mut vars = HashMap::new();
+        vars.insert("coverImage".into(), id.into());
+        let ctx = RenderContext {
+            vars,
+            ..Default::default()
+        };
+        let logo = LogoSpec {
+            id: "{coverImage}".into(),
+            src: "{title}.png".into(),
+            width: 100.0,
+            height: 100.0,
+            ..Default::default()
+        };
+        let assets = FsAssetResolver::new(&base);
+        let bytes = fetch_logo_bytes(&logo, &assets, &ctx, "").expect("id resolved");
+        assert_eq!(bytes, b"RIFF....WEBP");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn hero_falls_back_to_src_when_cover_image_unset() {
+        use super::super::style::LogoSpec;
+        use crate::assets::FsAssetResolver;
+
+        let base = std::env::temp_dir().join("mdpdf-cover-src-fallback-test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("MiR250 Manual.png"), b"\x89PNG-bytes").unwrap();
+
+        let ctx = RenderContext {
+            title: "MiR250 Manual".into(),
+            ..Default::default()
+        };
+        let logo = LogoSpec {
+            id: "{coverImage}".into(),
+            src: "{title}.png".into(),
+            width: 100.0,
+            height: 100.0,
+            ..Default::default()
+        };
+        let assets = FsAssetResolver::new(&base);
+        let bytes = fetch_logo_bytes(&logo, &assets, &ctx, "").expect("src fallback");
+        assert_eq!(bytes, b"\x89PNG-bytes");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

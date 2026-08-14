@@ -793,9 +793,10 @@ pub struct CoverPageStyle {
     pub logo_position: LogoPosition,
     /// Optional hero image (e.g. a product photo) drawn below the cover
     /// metadata — a second image slot so a cover can show both a brand
-    /// logo (above the title) and a hero image. `src` is a template
-    /// (`{title}` / any frontmatter var), so e.g. `{title}.png` resolves
-    /// to an asset named after the document title.
+    /// logo (above the title) and a hero image. `id` / `src` are templates
+    /// (`{title}` / any frontmatter var). Prefer `id` for an asset-library
+    /// GUID (`{coverImage}`); `src` still accepts a filename such as
+    /// `{title}.png`.
     pub hero: Option<LogoSpec>,
     /// Gap above the hero image.
     pub hero_gap: f32,
@@ -1403,8 +1404,13 @@ pub struct HeaderFooterSlots {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct LogoSpec {
+    /// Asset-library GUID (file stem), same contract as `{% media id="…" /%}`.
+    /// Template-substituted like `src`. Tried before `src`; probes
+    /// `{id}.webp` / `.png` / … then `AssetResolver::resolve_id`.
+    pub id: String,
     /// Asset URI — anything the configured asset resolver understands
-    /// (`file://path`, relative path, `https://…`, `arca://…`).
+    /// (`file://path`, relative path, `https://…`, `arca://…`). A bare
+    /// GUID with no extension is treated as an `id`.
     pub src: String,
     pub width: f32,
     pub height: f32,
@@ -1417,6 +1423,7 @@ pub struct LogoSpec {
 impl Default for LogoSpec {
     fn default() -> Self {
         Self {
+            id: String::new(),
             src: String::new(),
             width: 0.0,
             height: 0.0,
