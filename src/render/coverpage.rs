@@ -64,12 +64,13 @@ pub fn build_coverpage_blocks(
     // covers can pick a product image from frontmatter, e.g.
     // `{title}.png` → `MiR250 Manual.png`.
     let logo_block = coverpage.logo.as_ref().and_then(|logo| {
-        build_logo_block(
+        build_cover_image(
             logo,
             body_left,
             column_w,
             coverpage.align,
             assets,
+            CoverImageFit::Fixed,
             render_ctx,
             date_str,
         )
@@ -223,21 +224,28 @@ pub fn build_coverpage_blocks(
     // title) and a hero image. `id` / `src` use the same `{title}` /
     // frontmatter substitution as detail lines so one style can serve every
     // product manual (`id = "{coverImage}"` or `src = "{title}.png"`).
-    if let Some(hero) = &coverpage.hero
-        && let Some(block) = build_logo_block(
+    // Sized to the cover column width, keeping the source aspect ratio, and
+    // shrunk if it would overflow the page.
+    if let Some(hero) = &coverpage.hero {
+        let used: f32 = out.iter().map(|b| b.height + b.space_after).sum();
+        let cover_margin_y = coverpage.margin_y.unwrap_or(style.margin_y);
+        let max_height =
+            (style.page_height - 2.0 * cover_margin_y - used - coverpage.hero_gap).max(1.0);
+        if let Some(block) = build_cover_image(
             hero,
             body_left,
             column_w,
             coverpage.align,
             assets,
+            CoverImageFit::FitColumn { max_height },
             render_ctx,
             date_str,
-        )
-    {
-        if coverpage.hero_gap > 0.0 {
-            out.push(spacer_block(body_left, coverpage.hero_gap));
+        ) {
+            if coverpage.hero_gap > 0.0 {
+                out.push(spacer_block(body_left, coverpage.hero_gap));
+            }
+            out.push(block);
         }
-        out.push(block);
     }
 
     // Page break — flushes the cover page.
@@ -439,27 +447,34 @@ fn cover_text_block(
     }
 }
 
-/// Decode the configured logo via the asset resolver and return a
-/// centred Image (raster) or Svg block. Width/height come from the
-/// `LogoSpec`; horizontal position is centred in the body column.
-/// `id` / `src` support the same `{title}` / frontmatter templates as
-/// cover text so hero art can be selected per document.
-fn build_logo_block(
-    logo: &super::style::LogoSpec,
+/// How a cover-page image is sized.
+enum CoverImageFit {
+    /// Stretch to the spec's explicit width × height (brand logos).
+    Fixed,
+    /// Fill the cover column width, keep the source aspect ratio, and
+    /// shrink if the result would exceed `max_height`.
+    FitColumn { max_height: f32 },
+}
+
+/// Decode a cover-page image (logo or hero) and return an Image / Svg
+/// block. `src` / `id` are templates against `RenderContext`. Width/height
+/// come from `CoverImageFit`; horizontal position follows `align`.
+fn build_cover_image(
+    spec: &super::style::LogoSpec,
     body_left: f32,
     column_w: f32,
     align: CoverAlign,
     assets: &dyn AssetResolver,
+    fit: CoverImageFit,
     render_ctx: &RenderContext,
     date_str: &str,
 ) -> Option<Block> {
-    if logo.width <= 0.0 || logo.height <= 0.0 {
+    if matches!(fit, CoverImageFit::Fixed) && (spec.width <= 0.0 || spec.height <= 0.0) {
         return None;
     }
-    let bytes = fetch_logo_bytes(logo, assets, render_ctx, date_str)?;
+    let bytes = fetch_logo_bytes(spec, assets, render_ctx, date_str)?;
     let format = sniff_format(&bytes);
-    let x = cover_image_x(body_left, column_w, logo.width, align);
-    let block = match format {
+    let (natural_w, natural_h, raster, svg) = match format {
         MediaFormat::Png | MediaFormat::Jpeg | MediaFormat::Gif | MediaFormat::Webp => {
             let image = match format {
                 MediaFormat::Png => KrillaImage::from_png(bytes.into(), false).ok()?,
@@ -468,46 +483,73 @@ fn build_logo_block(
                 MediaFormat::Webp => KrillaImage::from_webp(bytes.into(), false).ok()?,
                 _ => unreachable!(),
             };
-            Block {
-                height: logo.height,
-                space_after: 0.0,
-                draw: BlockDraw::Image {
-                    image,
-                    x,
-                    width: logo.width,
-                    height: logo.height,
-                    caption: None,
-                },
-                outline: None,
-                anchor_id: None,
-                tag_role: None,
-                page_column: 0,
-                column_span: false,
-            }
+            let (px_w, px_h) = image.size();
+            (px_w as f32, px_h as f32, Some(image), None)
         }
         MediaFormat::Svg => {
             let opts = usvg::Options::default();
             let tree = SvgTree::from_data(&bytes, &opts).ok()?;
-            Block {
-                height: logo.height,
-                space_after: 0.0,
-                draw: BlockDraw::Svg {
-                    tree: Arc::new(tree),
-                    x,
-                    width: logo.width,
-                    height: logo.height,
-                    caption: None,
-                },
-                outline: None,
-                anchor_id: None,
-                tag_role: None,
-                page_column: 0,
-                column_span: false,
-            }
+            let size = tree.size();
+            (size.width(), size.height(), None, Some(Arc::new(tree)))
         }
         _ => return None,
     };
-    Some(block)
+    let (width, height) = match fit {
+        CoverImageFit::Fixed => (spec.width, spec.height),
+        CoverImageFit::FitColumn { max_height } => {
+            fit_cover_hero(natural_w, natural_h, column_w, max_height)
+        }
+    };
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let x = cover_image_x(body_left, column_w, width, align);
+    let draw = if let Some(image) = raster {
+        BlockDraw::Image {
+            image,
+            x,
+            width,
+            height,
+            caption: None,
+        }
+    } else if let Some(tree) = svg {
+        BlockDraw::Svg {
+            tree,
+            x,
+            width,
+            height,
+            caption: None,
+        }
+    } else {
+        return None;
+    };
+    Some(Block {
+        height,
+        space_after: 0.0,
+        draw,
+        outline: None,
+        anchor_id: None,
+        tag_role: None,
+        page_column: 0,
+        column_span: false,
+    })
+}
+
+/// Scale `(natural_w, natural_h)` to fill `max_w`, keeping aspect ratio.
+/// Shrinks further if the result would exceed `max_h`. Upscales so a
+/// small source still spans the cover column.
+fn fit_cover_hero(natural_w: f32, natural_h: f32, max_w: f32, max_h: f32) -> (f32, f32) {
+    if natural_w <= 0.0 || natural_h <= 0.0 {
+        return (max_w, max_h.min(max_w * 0.5).max(1.0));
+    }
+    let mut width = max_w;
+    let mut height = max_w * (natural_h / natural_w);
+    if max_h > 0.0 && height > max_h {
+        let scale = max_h / height;
+        width *= scale;
+        height = max_h;
+    }
+    (width, height)
 }
 
 fn cover_image_x(body_left: f32, column_w: f32, width: f32, align: CoverAlign) -> f32 {
@@ -688,5 +730,28 @@ mod tests {
         assert_eq!(bytes, b"\x89PNG-bytes");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fit_cover_hero_fills_width_and_keeps_ratio() {
+        // 16:9 into a 515-pt column.
+        let (w, h) = fit_cover_hero(1600.0, 900.0, 515.0, 800.0);
+        assert!((w - 515.0).abs() < 0.01);
+        assert!((h - 515.0 * 9.0 / 16.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn fit_cover_hero_upscales_small_source() {
+        let (w, h) = fit_cover_hero(100.0, 50.0, 400.0, 800.0);
+        assert!((w - 400.0).abs() < 0.01);
+        assert!((h - 200.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn fit_cover_hero_shrinks_tall_image_to_max_height() {
+        // 2:3 portrait would be 772.5 pt tall at 515 pt wide.
+        let (w, h) = fit_cover_hero(2000.0, 3000.0, 515.0, 400.0);
+        assert!((h - 400.0).abs() < 0.01);
+        assert!((w - 400.0 * 2.0 / 3.0).abs() < 0.01);
     }
 }

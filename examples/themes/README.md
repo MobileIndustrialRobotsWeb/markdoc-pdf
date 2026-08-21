@@ -408,9 +408,9 @@ Used by `logo_left`/`logo_center`/`logo_right`, `[coverpage.logo]`,
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `…id` | string (template) | `""` | Asset-library GUID (file stem), same as `{% media id="…" /%}`. Tried before `src`. |
-| `…src` | string (template) | `""` | Asset URI (`file://`, relative path, `https://`, `arca://`). A bare GUID with no extension is treated as an `id`. |
-| `…width` | number (pt) | `0.0` | Display width (no auto-scaling). |
-| `…height` | number (pt) | `0.0` | Display height. |
+| `…src` | string (template) | `""` | Asset URI (`file://`, relative path, `https://`, `arca://`). A bare GUID with no extension is treated as an `id`. Cover-page values are templates. |
+| `…width` | number (pt) | `0.0` | Display width. Required for logos; ignored for `[coverpage.hero]` (fills the cover column, keeps aspect ratio). |
+| `…height` | number (pt) | `0.0` | Display height. Required for logos; ignored for `[coverpage.hero]`. |
 | `…gap` | number (pt) | `6.0` | Gap between logo and slot text (LEFT/RIGHT header/footer slots only). |
 
 ### Notice banner
@@ -453,7 +453,7 @@ optional logo tables (see [Logo spec](#logo-spec)).
 | `coverpage.enabled` | bool | `false` | Render a synthesised cover page before body content. |
 | `coverpage.logo` | optional table (logo) | unset | Cover logo image. |
 | `coverpage.logo_position` | `"above"` \| `"below_title"` | `"above"` | Logo position relative to the title. |
-| `coverpage.hero` | optional table (logo) | unset | Optional hero image below the cover metadata. |
+| `coverpage.hero` | optional table (logo) | unset | Optional hero image below the cover metadata. Fills the cover column width and keeps the source aspect ratio (`width`/`height` ignored). |
 | `coverpage.hero_gap` | number (pt) | `40.0` | Gap above the hero image. |
 | `coverpage.top_margin` | number (pt) | `200.0` | Vertical space above the first element. |
 | `coverpage.logo_to_title_gap` | number (pt) | `32.0` | Gap between logo and title. |
