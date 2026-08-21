@@ -292,8 +292,11 @@ pub fn render_pdf_with(
     let inner_x = style.margin_x;
     let inner_w = style.page_width - 2.0 * style.margin_x;
 
-    let cover_first_page = style.coverpage.enabled
-        && (style.coverpage.margin_x.is_some() || style.coverpage.margin_y.is_some());
+    // A synthesised cover always uses its own first-page geometry. Previously
+    // this only kicked in when `coverpage.margin_x` / `margin_y` were set, so
+    // a default cover still reserved header/footer space — even with
+    // `skip_first_page`. Auto-fit heroes then overflowed onto page 2.
+    let cover_first_page = style.coverpage.enabled;
     let cover_margin_y = style.coverpage.margin_y.unwrap_or(style.margin_y);
     let cover_hf = if style.page_decoration.skip_first_page {
         0.0

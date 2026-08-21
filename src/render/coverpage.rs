@@ -229,8 +229,11 @@ pub fn build_coverpage_blocks(
     if let Some(hero) = &coverpage.hero {
         let used: f32 = out.iter().map(|b| b.height + b.space_after).sum();
         let cover_margin_y = coverpage.margin_y.unwrap_or(style.margin_y);
+        // Must match the cover's first-page budget in `render::mod` (page
+        // height minus cover margins; header/footer are skipped). 1 pt of
+        // slack avoids float rounding pushing the hero onto page 2.
         let max_height =
-            (style.page_height - 2.0 * cover_margin_y - used - coverpage.hero_gap).max(1.0);
+            (style.page_height - 2.0 * cover_margin_y - used - coverpage.hero_gap - 1.0).max(1.0);
         if let Some(block) = build_cover_image(
             hero,
             body_left,
