@@ -655,9 +655,11 @@ pub fn emit_watermark(
             // Reuse the logo decoder + cache — same kind of asset.
             let logo = LogoSpec {
                 src: img.src.clone(),
+                id: String::new(),
                 width: img.width,
                 height: img.height,
                 gap: 0.0,
+                ..Default::default()
             };
             let entry = media_cache
                 .entry(img.src.clone())

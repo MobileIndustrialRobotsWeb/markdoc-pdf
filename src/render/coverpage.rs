@@ -60,11 +60,21 @@ pub fn build_coverpage_blocks(
     // Optional logo / hero image (best-effort — silently skipped on
     // decode failure). Decoded once here so we can place it either
     // above the title or between title and subtitle without
-    // duplicating the asset-resolver code.
-    let logo_block = coverpage
-        .logo
-        .as_ref()
-        .and_then(|logo| build_logo_block(logo, body_left, column_w, coverpage.align, assets));
+    // duplicating the asset-resolver code. `src` is a template so
+    // covers can pick a product image from frontmatter, e.g.
+    // `{title}.png` → `MiR250 Manual.png`.
+    let logo_block = coverpage.logo.as_ref().and_then(|logo| {
+        build_cover_image(
+            logo,
+            body_left,
+            column_w,
+            coverpage.align,
+            assets,
+            CoverImageFit::Fixed,
+            render_ctx,
+            date_str,
+        )
+    });
 
     // Logo above the title (default).
     if coverpage.logo_position == LogoPosition::Above
@@ -211,14 +221,34 @@ pub fn build_coverpage_blocks(
 
     // Optional hero image (e.g. a product photo) below the metadata. Drawn
     // from its own slot so a cover can carry both a brand logo (above the
-    // title) and a hero image.
-    if let Some(hero) = &coverpage.hero
-        && let Some(block) = build_logo_block(hero, body_left, column_w, coverpage.align, assets)
-    {
-        if coverpage.hero_gap > 0.0 {
-            out.push(spacer_block(body_left, coverpage.hero_gap));
+    // title) and a hero image. `id` / `src` use the same `{title}` /
+    // frontmatter substitution as detail lines so one style can serve every
+    // product manual (`id = "{coverImage}"` or `src = "{title}.png"`).
+    // Sized to the cover column width, keeping the source aspect ratio, and
+    // shrunk if it would overflow the page.
+    if let Some(hero) = &coverpage.hero {
+        let used: f32 = out.iter().map(|b| b.height + b.space_after).sum();
+        let cover_margin_y = coverpage.margin_y.unwrap_or(style.margin_y);
+        // Must match the cover's first-page budget in `render::mod` (page
+        // height minus cover margins; header/footer are skipped). 1 pt of
+        // slack avoids float rounding pushing the hero onto page 2.
+        let max_height =
+            (style.page_height - 2.0 * cover_margin_y - used - coverpage.hero_gap - 1.0).max(1.0);
+        if let Some(block) = build_cover_image(
+            hero,
+            body_left,
+            column_w,
+            coverpage.align,
+            assets,
+            CoverImageFit::FitColumn { max_height },
+            render_ctx,
+            date_str,
+        ) {
+            if coverpage.hero_gap > 0.0 {
+                out.push(spacer_block(body_left, coverpage.hero_gap));
+            }
+            out.push(block);
         }
-        out.push(block);
     }
 
     // Page break — flushes the cover page.
@@ -420,23 +450,34 @@ fn cover_text_block(
     }
 }
 
-/// Decode the configured logo via the asset resolver and return a
-/// centred Image (raster) or Svg block. Width/height come from the
-/// `LogoSpec`; horizontal position is centred in the body column.
-fn build_logo_block(
-    logo: &super::style::LogoSpec,
+/// How a cover-page image is sized.
+enum CoverImageFit {
+    /// Stretch to the spec's explicit width × height (brand logos).
+    Fixed,
+    /// Fill the cover column width, keep the source aspect ratio, and
+    /// shrink if the result would exceed `max_height`.
+    FitColumn { max_height: f32 },
+}
+
+/// Decode a cover-page image (logo or hero) and return an Image / Svg
+/// block. `src` / `id` are templates against `RenderContext`. Width/height
+/// come from `CoverImageFit`; horizontal position follows `align`.
+fn build_cover_image(
+    spec: &super::style::LogoSpec,
     body_left: f32,
     column_w: f32,
     align: CoverAlign,
     assets: &dyn AssetResolver,
+    fit: CoverImageFit,
+    render_ctx: &RenderContext,
+    date_str: &str,
 ) -> Option<Block> {
-    if logo.src.is_empty() || logo.width <= 0.0 || logo.height <= 0.0 {
+    if matches!(fit, CoverImageFit::Fixed) && (spec.width <= 0.0 || spec.height <= 0.0) {
         return None;
     }
-    let bytes = assets.fetch(&logo.src).ok()?;
+    let bytes = fetch_logo_bytes(spec, assets, render_ctx, date_str)?;
     let format = sniff_format(&bytes);
-    let x = cover_image_x(body_left, column_w, logo.width, align);
-    let block = match format {
+    let (natural_w, natural_h, raster, svg) = match format {
         MediaFormat::Png | MediaFormat::Jpeg | MediaFormat::Gif | MediaFormat::Webp => {
             let image = match format {
                 MediaFormat::Png => KrillaImage::from_png(bytes.into(), false).ok()?,
@@ -445,51 +486,275 @@ fn build_logo_block(
                 MediaFormat::Webp => KrillaImage::from_webp(bytes.into(), false).ok()?,
                 _ => unreachable!(),
             };
-            Block {
-                height: logo.height,
-                space_after: 0.0,
-                draw: BlockDraw::Image {
-                    image,
-                    x,
-                    width: logo.width,
-                    height: logo.height,
-                    caption: None,
-                },
-                outline: None,
-                anchor_id: None,
-                tag_role: None,
-                page_column: 0,
-                column_span: false,
-            }
+            let (px_w, px_h) = image.size();
+            (px_w as f32, px_h as f32, Some(image), None)
         }
         MediaFormat::Svg => {
             let opts = usvg::Options::default();
             let tree = SvgTree::from_data(&bytes, &opts).ok()?;
-            Block {
-                height: logo.height,
-                space_after: 0.0,
-                draw: BlockDraw::Svg {
-                    tree: Arc::new(tree),
-                    x,
-                    width: logo.width,
-                    height: logo.height,
-                    caption: None,
-                },
-                outline: None,
-                anchor_id: None,
-                tag_role: None,
-                page_column: 0,
-                column_span: false,
-            }
+            let size = tree.size();
+            (size.width(), size.height(), None, Some(Arc::new(tree)))
         }
         _ => return None,
     };
-    Some(block)
+    let (width, height) = match fit {
+        CoverImageFit::Fixed => (spec.width, spec.height),
+        CoverImageFit::FitColumn { max_height } => {
+            fit_cover_hero(natural_w, natural_h, column_w, max_height)
+        }
+    };
+    if width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    let x = cover_image_x(body_left, column_w, width, align);
+    let draw = if let Some(image) = raster {
+        BlockDraw::Image {
+            image,
+            x,
+            width,
+            height,
+            caption: None,
+        }
+    } else if let Some(tree) = svg {
+        BlockDraw::Svg {
+            tree,
+            x,
+            width,
+            height,
+            caption: None,
+        }
+    } else {
+        return None;
+    };
+    Some(Block {
+        height,
+        space_after: 0.0,
+        draw,
+        outline: None,
+        anchor_id: None,
+        tag_role: None,
+        page_column: 0,
+        column_span: false,
+    })
+}
+
+/// Scale `(natural_w, natural_h)` to fill `max_w`, keeping aspect ratio.
+/// Shrinks further if the result would exceed `max_h`. Upscales so a
+/// small source still spans the cover column.
+fn fit_cover_hero(natural_w: f32, natural_h: f32, max_w: f32, max_h: f32) -> (f32, f32) {
+    if natural_w <= 0.0 || natural_h <= 0.0 {
+        return (max_w, max_h.min(max_w * 0.5).max(1.0));
+    }
+    let mut width = max_w;
+    let mut height = max_w * (natural_h / natural_w);
+    if max_h > 0.0 && height > max_h {
+        let scale = max_h / height;
+        width *= scale;
+        height = max_h;
+    }
+    (width, height)
 }
 
 fn cover_image_x(body_left: f32, column_w: f32, width: f32, align: CoverAlign) -> f32 {
     match align {
         CoverAlign::Left => body_left,
         CoverAlign::Center => body_left + (column_w - width).max(0.0) * 0.5,
+    }
+}
+
+/// Load cover/logo bytes. `id` (asset-library GUID) is tried first, then
+/// `src` as a path, then `src` as a bare GUID. Unresolved `{templates}`
+/// are skipped so `id = "{coverImage}"` can fall back to `src`.
+fn fetch_logo_bytes(
+    logo: &super::style::LogoSpec,
+    assets: &dyn AssetResolver,
+    render_ctx: &RenderContext,
+    date_str: &str,
+) -> Option<Vec<u8>> {
+    let id = resolved_template(&substitute(&logo.id, render_ctx, date_str));
+    if !id.is_empty()
+        && let Some(bytes) = fetch_by_asset_id(assets, &id)
+    {
+        return Some(bytes);
+    }
+    let src = resolved_template(&substitute(&logo.src, render_ctx, date_str));
+    if src.is_empty() {
+        return None;
+    }
+    if let Ok(bytes) = assets.fetch(&src) {
+        return Some(bytes);
+    }
+    if looks_like_asset_id(&src) {
+        return fetch_by_asset_id(assets, &src);
+    }
+    None
+}
+
+fn resolved_template(value: &str) -> String {
+    if value.contains('{') {
+        String::new()
+    } else {
+        value.to_string()
+    }
+}
+
+fn looks_like_asset_id(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains('/')
+        && !value.contains('\\')
+        && std::path::Path::new(value).extension().is_none()
+}
+
+fn fetch_by_asset_id(assets: &dyn AssetResolver, id: &str) -> Option<Vec<u8>> {
+    const EXTS: [&str; 6] = ["webp", "png", "jpg", "jpeg", "gif", "svg"];
+    for ext in EXTS {
+        if let Ok(bytes) = assets.fetch(&format!("{id}.{ext}")) {
+            return Some(bytes);
+        }
+    }
+    if let Some(path) = assets.resolve_id(id)
+        && let Ok(bytes) = assets.fetch(&path)
+    {
+        return Some(bytes);
+    }
+    assets.fetch(id).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn hero_src_substitutes_title() {
+        let ctx = RenderContext {
+            title: "MiR250 Manual".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            substitute("{title}.png", &ctx, ""),
+            "MiR250 Manual.png"
+        );
+    }
+
+    #[test]
+    fn hero_src_leaves_static_path_unchanged() {
+        let ctx = RenderContext::default();
+        assert_eq!(
+            substitute("MiR_Logo=Positive.svg", &ctx, ""),
+            "MiR_Logo=Positive.svg"
+        );
+    }
+
+    #[test]
+    fn hero_src_substitutes_frontmatter_vars() {
+        let mut vars = HashMap::new();
+        vars.insert("productImage".into(), "MiR250 Hook Manual".into());
+        let ctx = RenderContext {
+            vars,
+            ..Default::default()
+        };
+        assert_eq!(
+            substitute("{productImage}.png", &ctx, ""),
+            "MiR250 Hook Manual.png"
+        );
+    }
+
+    #[test]
+    fn unresolved_cover_image_template_is_skipped() {
+        assert_eq!(resolved_template("{coverImage}"), "");
+        assert_eq!(
+            resolved_template("09f3a884-2e34-4821-81ef-2935a85a7477"),
+            "09f3a884-2e34-4821-81ef-2935a85a7477"
+        );
+    }
+
+    #[test]
+    fn bare_guid_looks_like_asset_id() {
+        assert!(looks_like_asset_id("09f3a884-2e34-4821-81ef-2935a85a7477"));
+        assert!(!looks_like_asset_id("MiR250 Manual.png"));
+        assert!(!looks_like_asset_id("images/hero.webp"));
+    }
+
+    #[test]
+    fn hero_id_loads_asset_library_file() {
+        use super::super::style::LogoSpec;
+        use crate::assets::FsAssetResolver;
+
+        let base = std::env::temp_dir().join("mdpdf-cover-id-test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let id = "09f3a884-2e34-4821-81ef-2935a85a7477";
+        std::fs::write(base.join(format!("{id}.webp")), b"RIFF....WEBP").unwrap();
+
+        let mut vars = HashMap::new();
+        vars.insert("coverImage".into(), id.into());
+        let ctx = RenderContext {
+            vars,
+            ..Default::default()
+        };
+        let logo = LogoSpec {
+            id: "{coverImage}".into(),
+            src: "{title}.png".into(),
+            width: 100.0,
+            height: 100.0,
+            ..Default::default()
+        };
+        let assets = FsAssetResolver::new(&base);
+        let bytes = fetch_logo_bytes(&logo, &assets, &ctx, "").expect("id resolved");
+        assert_eq!(bytes, b"RIFF....WEBP");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn hero_falls_back_to_src_when_cover_image_unset() {
+        use super::super::style::LogoSpec;
+        use crate::assets::FsAssetResolver;
+
+        let base = std::env::temp_dir().join("mdpdf-cover-src-fallback-test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("MiR250 Manual.png"), b"\x89PNG-bytes").unwrap();
+
+        let ctx = RenderContext {
+            title: "MiR250 Manual".into(),
+            ..Default::default()
+        };
+        let logo = LogoSpec {
+            id: "{coverImage}".into(),
+            src: "{title}.png".into(),
+            width: 100.0,
+            height: 100.0,
+            ..Default::default()
+        };
+        let assets = FsAssetResolver::new(&base);
+        let bytes = fetch_logo_bytes(&logo, &assets, &ctx, "").expect("src fallback");
+        assert_eq!(bytes, b"\x89PNG-bytes");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fit_cover_hero_fills_width_and_keeps_ratio() {
+        // 16:9 into a 515-pt column.
+        let (w, h) = fit_cover_hero(1600.0, 900.0, 515.0, 800.0);
+        assert!((w - 515.0).abs() < 0.01);
+        assert!((h - 515.0 * 9.0 / 16.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn fit_cover_hero_upscales_small_source() {
+        let (w, h) = fit_cover_hero(100.0, 50.0, 400.0, 800.0);
+        assert!((w - 400.0).abs() < 0.01);
+        assert!((h - 200.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn fit_cover_hero_shrinks_tall_image_to_max_height() {
+        // 2:3 portrait would be 772.5 pt tall at 515 pt wide.
+        let (w, h) = fit_cover_hero(2000.0, 3000.0, 515.0, 400.0);
+        assert!((h - 400.0).abs() < 0.01);
+        assert!((w - 400.0 * 2.0 / 3.0).abs() < 0.01);
     }
 }

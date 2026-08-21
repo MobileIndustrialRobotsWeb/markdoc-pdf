@@ -1469,6 +1469,28 @@ fn layout_children(
             i += 2;
             continue;
         }
+
+        // Consecutive size="small" images (or `<p>` wrappers that hold
+        // only one) share a row — same look as the web inline-block
+        // pairing used in spare-part procedures.
+        if let Some(first) = small_media_tag(&children[i]) {
+            let mut run: Vec<&Tag> = vec![first];
+            let mut j = i + 1;
+            while j < children.len() {
+                if let Some(next) = small_media_tag(&children[j]) {
+                    run.push(next);
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            if run.len() >= 2 {
+                out.extend(layout_small_media_row(&run, x, width, ctx));
+                i = j;
+                continue;
+            }
+        }
+
         out.extend(layout_node(&children[i], x, width, ctx));
         i += 1;
     }
@@ -1730,26 +1752,51 @@ fn layout_paragraph(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> V
     // flow as a normal paragraph.
     let mut promoted: Vec<Block> = Vec::new();
     let mut text_children: Vec<RenderableTreeNode> = Vec::new();
+    let mut media_run: Vec<&Tag> = Vec::new();
+
+    let flush_media_run = |run: &mut Vec<&Tag>, out: &mut Vec<Block>, ctx: &mut LayoutCtx<'_>| {
+        if run.is_empty() {
+            return;
+        }
+        if run.len() >= 2 && run.iter().all(|t| media_is_small(t)) {
+            out.extend(layout_small_media_row(run, x, width, ctx));
+        } else {
+            for t in run.iter() {
+                out.extend(layout_media(t, x, width, ctx));
+            }
+        }
+        run.clear();
+    };
+
     for child in &tag.children {
         if let RenderableTreeNode::Tag(t) = child {
             match t.name.as_str() {
                 "img" | "media" => {
-                    promoted.extend(layout_media(t, x, width, ctx));
+                    if media_is_small(t) {
+                        media_run.push(t);
+                    } else {
+                        flush_media_run(&mut media_run, &mut promoted, ctx);
+                        promoted.extend(layout_media(t, x, width, ctx));
+                    }
                     continue;
                 }
                 "callout" => {
+                    flush_media_run(&mut media_run, &mut promoted, ctx);
                     promoted.extend(layout_callout(t, x, width, ctx));
                     continue;
                 }
                 "input" => {
+                    flush_media_run(&mut media_run, &mut promoted, ctx);
                     promoted.extend(layout_input(t, x, width, ctx));
                     continue;
                 }
                 _ => {}
             }
         }
+        flush_media_run(&mut media_run, &mut promoted, ctx);
         text_children.push(child.clone());
     }
+    flush_media_run(&mut media_run, &mut promoted, ctx);
 
     let mut out = promoted;
 
@@ -1763,44 +1810,7 @@ fn layout_paragraph(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> V
     // restyles the underlying glyphs. Done before hyphenation: links
     // pin the byte ranges anyway, so the soft-hyphen guard below
     // already skips paragraphs that contain any link.
-    let link_style = &ctx.style.link;
-    let link_color: krilla::color::rgb::Color = link_style.color.into();
-    for link in &inlines.links {
-        inlines.style_ranges.push(InlineRange {
-            start: link.start,
-            end: link.end,
-            prop: InlineProp::Color(link_color),
-        });
-        if link_style.italic {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Italic,
-            });
-        }
-        if link_style.bold {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Bold,
-            });
-        }
-    }
-    // Express the link underline as a parley decoration over the link's
-    // byte range, so the unified decoration pass draws it. Skipped when the
-    // style disables underlining; the colour follows the link text tint
-    // pushed above.
-    if link_style.underline {
-        for link in &inlines.links {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Underline {
-                    thickness: link_style.underline_thickness,
-                },
-            });
-        }
-    }
+    apply_link_style(&mut inlines, &ctx.style.link);
     // Hyphenate plain paragraphs only — inline ranges, links, anchors
     // and footnote calls all key on byte offsets, and inserting soft
     // hyphens shifts those, so we skip the pass when any are present.
@@ -4182,40 +4192,7 @@ fn layout_paragraph_float(
         return Vec::new();
     }
     // Link text styling — identical to `layout_paragraph`.
-    let link_style = &ctx.style.link;
-    let link_color: krilla::color::rgb::Color = link_style.color.into();
-    for link in &inlines.links {
-        inlines.style_ranges.push(InlineRange {
-            start: link.start,
-            end: link.end,
-            prop: InlineProp::Color(link_color),
-        });
-        if link_style.italic {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Italic,
-            });
-        }
-        if link_style.bold {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Bold,
-            });
-        }
-    }
-    if link_style.underline {
-        for link in &inlines.links {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Underline {
-                    thickness: link_style.underline_thickness,
-                },
-            });
-        }
-    }
+    apply_link_style(&mut inlines, &ctx.style.link);
     // Hyphenate only when nothing keys on byte offsets (same guard as
     // `layout_paragraph`) — helps fill the narrow lines beside the image.
     if let Some(h) = ctx.hyphenator
@@ -4591,40 +4568,7 @@ fn layout_float_anchored(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>)
     }
 
     // Link text styling (colour / weight / underline), as paragraphs do.
-    let link_style = &ctx.style.link;
-    let link_color: krilla::color::rgb::Color = link_style.color.into();
-    for link in &inlines.links {
-        inlines.style_ranges.push(InlineRange {
-            start: link.start,
-            end: link.end,
-            prop: InlineProp::Color(link_color),
-        });
-        if link_style.italic {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Italic,
-            });
-        }
-        if link_style.bold {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Bold,
-            });
-        }
-    }
-    if link_style.underline {
-        for link in &inlines.links {
-            inlines.style_ranges.push(InlineRange {
-                start: link.start,
-                end: link.end,
-                prop: InlineProp::Underline {
-                    thickness: link_style.underline_thickness,
-                },
-            });
-        }
-    }
+    apply_link_style(&mut inlines, &ctx.style.link);
     // No hyphenation here: it would insert soft hyphens and shift the float
     // anchor byte offsets recorded above.
 
@@ -5464,7 +5408,86 @@ fn layout_cell_content(
 
 // ── Media (img / media) ─────────────────────────────────────────────────
 
+/// Horizontal inset applied to every image, matching the web `5px` L/R
+/// padding on `{% image %}`.
+const IMAGE_H_PAD: f32 = 5.0;
+
+fn media_is_small(tag: &Tag) -> bool {
+    matches!(
+        tag.attributes.get("size"),
+        Some(Scalar::String(s)) if s.trim() == "small"
+    )
+}
+
+/// A direct `<img>`/`<media size="small">`, or a `<p>` whose only media
+/// child is small — the shape Markdoc produces for a lone image tag on
+/// its own line under a list item.
+fn small_media_tag(node: &RenderableTreeNode) -> Option<&Tag> {
+    match node {
+        RenderableTreeNode::Tag(t) if t.name == "img" || t.name == "media" => {
+            media_is_small(t).then_some(t.as_ref())
+        }
+        RenderableTreeNode::Tag(t) if t.name == "p" => {
+            let mut media: Option<&Tag> = None;
+            for child in &t.children {
+                match child {
+                    RenderableTreeNode::Tag(inner)
+                        if inner.name == "img" || inner.name == "media" =>
+                    {
+                        if media.is_some() {
+                            return None;
+                        }
+                        media = Some(inner.as_ref());
+                    }
+                    RenderableTreeNode::Scalar(Scalar::String(s)) if s.trim().is_empty() => {}
+                    RenderableTreeNode::Scalar(Scalar::Null) => {}
+                    _ => return None,
+                }
+            }
+            media.filter(|m| media_is_small(m))
+        }
+        _ => None,
+    }
+}
+
+/// Place two or more `size="small"` images on one row (borderless equal
+/// columns), kept atomic so pagination never splits the pair.
+///
+/// Each tag keeps `size="small"` in the source for web pairing, but once
+/// the row already splits the column in half we fill each cell (override
+/// to `large`) — otherwise `small` × half-column ≈ 25 % page width and a
+/// large gutter appears between the pair.
+fn layout_small_media_row(
+    tags: &[&Tag],
+    x: f32,
+    width: f32,
+    ctx: &mut LayoutCtx<'_>,
+) -> Vec<Block> {
+    use parley::layout::Alignment;
+    let cells: Vec<Vec<RenderableTreeNode>> = tags
+        .iter()
+        .map(|t| {
+            let mut cell_tag = (*t).clone();
+            cell_tag.attributes.insert(
+                "size".to_string(),
+                Scalar::String("large".to_string()),
+            );
+            vec![RenderableTreeNode::Tag(Box::new(cell_tag))]
+        })
+        .collect();
+    let rows = layout_cells_row(cells, x, width, 0.0, None, Some(Alignment::Center), ctx);
+    vec![atomic_group(
+        rows,
+        x,
+        width,
+        ctx.style.paragraph_space_after,
+    )]
+}
+
 fn layout_media(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<Block> {
+    // Inset every image by IMAGE_H_PAD on both sides (web 5px L/R padding).
+    let x = x + IMAGE_H_PAD;
+    let width = (width - 2.0 * IMAGE_H_PAD).max(0.0);
     // Source resolution. Either an explicit `src` (markdown `![]()` or
     // `{% media src=… %}`), or an Arca `id` (`{% media id="<uuid>" /%}`).
     // In production Scriptor rewrites `id` to a concrete `src` before this
@@ -5756,7 +5779,7 @@ fn layout_table_cell_paragraph(
     // Table cells don't carry document footnotes for v1 — the
     // pagination pool only attaches to top-level body blocks, so
     // routing cell footnotes there could end up on the wrong page.
-    let inlines = Inlines::from_with_labels(
+    let mut inlines = Inlines::from_with_labels(
         &cell.children,
         &mut Vec::new(),
         Some(ctx.crossref_labels),
@@ -5764,6 +5787,9 @@ fn layout_table_cell_paragraph(
     if inlines.text.trim().is_empty() {
         return Vec::new();
     }
+    // Same link colour / weight / underline as body paragraphs so
+    // `{% tagref %}` and markdown links stay visually distinct in cells.
+    apply_link_style(&mut inlines, &ctx.style.link);
     let (weight, color) = if is_header {
         (700.0, ctx.style.table_header_text_color.into())
     } else {
@@ -5799,6 +5825,45 @@ fn layout_table_cell_paragraph(
         page_column: 0,
         column_span: false,
     }]
+}
+
+/// Tint / weight / underline every link range on `inlines` from the
+/// document's `[link]` style. Shared by paragraphs, floats, and table
+/// cells so `{% tagref %}` looks the same in every context.
+fn apply_link_style(inlines: &mut Inlines, link_style: &super::style::LinkStyle) {
+    let link_color: krilla::color::rgb::Color = link_style.color.into();
+    for link in &inlines.links {
+        inlines.style_ranges.push(InlineRange {
+            start: link.start,
+            end: link.end,
+            prop: InlineProp::Color(link_color),
+        });
+        if link_style.italic {
+            inlines.style_ranges.push(InlineRange {
+                start: link.start,
+                end: link.end,
+                prop: InlineProp::Italic,
+            });
+        }
+        if link_style.bold {
+            inlines.style_ranges.push(InlineRange {
+                start: link.start,
+                end: link.end,
+                prop: InlineProp::Bold,
+            });
+        }
+    }
+    if link_style.underline {
+        for link in &inlines.links {
+            inlines.style_ranges.push(InlineRange {
+                start: link.start,
+                end: link.end,
+                prop: InlineProp::Underline {
+                    thickness: link_style.underline_thickness,
+                },
+            });
+        }
+    }
 }
 
 #[cfg(test)]
