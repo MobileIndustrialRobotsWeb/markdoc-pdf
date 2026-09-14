@@ -126,7 +126,8 @@ renders `Copyright © 2026 by ACME LLC.` for a same-year release, or
 | `page_height` | number (pt) | `842.0` | Page height in PDF points (A4). |
 | `margin_x` | number (pt) | `72.0` | Left/right page margin. |
 | `margin_y` | number (pt) | `72.0` | Top/bottom page margin. |
-| `pad_to_even` | bool | `false` | If the doc ends on an odd page, append one blank (still header/footer/watermark-bearing) page so the physical total is even, for duplex printing. Counts toward `{total}`. |
+| `pad_to_even` | bool | `false` | If the doc ends on an odd page, append one blank (still header/footer/watermark-bearing) page so the physical total is even, for duplex printing. Counts toward `{total}`. Ignored when `pad_to_multiple` is greater than 1. |
+| `pad_to_multiple` | number | `0` | Append blank pages until the physical count is a multiple of this value (`4` for booklet / saddle-stitch). `0` or `1` leaves the count unchanged. Counts toward `{total}`. |
 
 ### Fonts
 

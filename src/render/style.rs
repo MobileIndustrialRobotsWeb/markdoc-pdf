@@ -426,7 +426,14 @@ pub struct Style {
     /// fresh sheet. The padding page carries the running header / footer
     /// (and watermark) like any other page but has no body content, and it
     /// is counted in the `{total}` page-of total. Off by default.
+    /// Ignored when [`pad_to_multiple`] is greater than 1.
     pub pad_to_even: bool,
+    /// Append blank pages (header / footer / watermark only) until the
+    /// physical page count is a multiple of this value. `0` or `1` leaves
+    /// the count unchanged. `4` is the booklet / saddle-stitch case (four
+    /// pages per folded sheet). Counts toward `{total}`. When set, it
+    /// supersedes [`pad_to_even`].
+    pub pad_to_multiple: u32,
 
     // ── Body text ─────────────────────────────────────────────────────
     pub body_font_size: f32,
@@ -607,6 +614,7 @@ impl Default for Style {
             margin_y: 72.0,
             page_layout: PageLayoutStyle::default(),
             pad_to_even: false,
+            pad_to_multiple: 0,
             text_align: TextAlign::default(),
             body_font_size: 11.0,
             body_line_height: 1.5,
@@ -1647,6 +1655,18 @@ impl Style {
     pub fn from_toml_file(path: impl AsRef<std::path::Path>) -> Result<Self, StyleLoadError> {
         let text = std::fs::read_to_string(path).map_err(StyleLoadError::Io)?;
         Self::from_toml_str(&text).map_err(StyleLoadError::Toml)
+    }
+
+    /// Page-count multiple used for trailing blank pages. `pad_to_multiple`
+    /// wins when it is greater than 1; otherwise `pad_to_even` means 2.
+    pub fn padding_multiple(&self) -> usize {
+        if self.pad_to_multiple > 1 {
+            self.pad_to_multiple as usize
+        } else if self.pad_to_even {
+            2
+        } else {
+            0
+        }
     }
 }
 

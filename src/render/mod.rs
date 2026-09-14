@@ -407,12 +407,12 @@ pub fn render_pdf_with(
     } else {
         body_with_pools
     };
-    // Duplex padding: if the document ends on an odd page, append one
-    // page so the physical sheet count is even. The padding page carries
-    // the running header / footer (and watermark) like any other page, but
-    // has no body content. `total_pages` is taken AFTER padding so the
-    // `{total}` page-of count includes it.
-    if needs_even_padding(pages.len(), style.pad_to_even) {
+    // Trailing blank pages so the physical count matches the configured
+    // multiple (`pad_to_multiple`, or 2 when only `pad_to_even` is set).
+    // Each padding page carries the running header / footer (and watermark)
+    // like any other page, but has no body content. `total_pages` is taken
+    // AFTER padding so the `{total}` page-of count includes them.
+    for _ in 0..padding_page_count(pages.len(), style.padding_multiple()) {
         pages.push((Vec::new(), Vec::new()));
     }
     let total_pages = pages.len();
@@ -1383,30 +1383,54 @@ fn apply_metadata(document: &mut Document, ctx: &RenderContext) {
     document.set_metadata(meta);
 }
 
-/// Whether a trailing page must be appended so the physical page count is
-/// even. Duplex (double-sided) printing wants each document to begin on the
-/// front of a fresh sheet, which requires an even total. `content_pages` is
-/// the count before padding; an empty document (0 pages) is already even and
-/// is left untouched.
-fn needs_even_padding(content_pages: usize, pad_to_even: bool) -> bool {
-    pad_to_even && content_pages % 2 == 1
+/// How many blank pages to append so `content_pages` is a multiple of
+/// `multiple`. `multiple <= 1` or an empty document (0 pages) adds nothing.
+fn padding_page_count(content_pages: usize, multiple: usize) -> usize {
+    if multiple <= 1 || content_pages == 0 {
+        return 0;
+    }
+    let rem = content_pages % multiple;
+    if rem == 0 {
+        0
+    } else {
+        multiple - rem
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::needs_even_padding;
+    use super::padding_page_count;
+    use super::style::Style;
 
     #[test]
-    fn even_padding_only_pads_odd_counts_when_enabled() {
-        // Enabled: an odd page count gains a trailing page; even is untouched.
-        assert!(needs_even_padding(1, true));
-        assert!(needs_even_padding(3, true));
-        assert!(!needs_even_padding(2, true));
-        assert!(!needs_even_padding(6, true));
-        // An empty document (0 pages) is already even.
-        assert!(!needs_even_padding(0, true));
-        // Disabled: never pads, regardless of parity.
-        assert!(!needs_even_padding(1, false));
-        assert!(!needs_even_padding(2, false));
+    fn padding_page_count_even_and_booklet() {
+        // Multiple of 2 (duplex): one blank when odd, none when even.
+        assert_eq!(padding_page_count(1, 2), 1);
+        assert_eq!(padding_page_count(3, 2), 1);
+        assert_eq!(padding_page_count(2, 2), 0);
+        assert_eq!(padding_page_count(6, 2), 0);
+        // Multiple of 4 (booklet): 1–3 blanks until the count is divisible by 4.
+        assert_eq!(padding_page_count(1, 4), 3);
+        assert_eq!(padding_page_count(2, 4), 2);
+        assert_eq!(padding_page_count(3, 4), 1);
+        assert_eq!(padding_page_count(4, 4), 0);
+        assert_eq!(padding_page_count(5, 4), 3);
+        assert_eq!(padding_page_count(6, 4), 2);
+        assert_eq!(padding_page_count(7, 4), 1);
+        assert_eq!(padding_page_count(8, 4), 0);
+        // Empty document and disabled multiple add nothing.
+        assert_eq!(padding_page_count(0, 4), 0);
+        assert_eq!(padding_page_count(3, 0), 0);
+        assert_eq!(padding_page_count(3, 1), 0);
+    }
+
+    #[test]
+    fn padding_multiple_prefers_explicit_over_even() {
+        let mut style = Style::default();
+        assert_eq!(style.padding_multiple(), 0);
+        style.pad_to_even = true;
+        assert_eq!(style.padding_multiple(), 2);
+        style.pad_to_multiple = 4;
+        assert_eq!(style.padding_multiple(), 4);
     }
 }

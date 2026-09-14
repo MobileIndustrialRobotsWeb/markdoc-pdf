@@ -95,8 +95,8 @@ Public modules:
 - **Layout features**: hyphenation (embedded en-US dictionary,
   swappable per language), per-page footnote pools, automatic
   Figure N / Table N numbering, table of contents, list of figures,
-  list of tables, cover page, watermarks, and even-page padding
-  (`pad_to_even`) for duplex (double-sided) printing.
+  list of tables, cover page, watermarks, and trailing-page padding
+  (`pad_to_even` / `pad_to_multiple`) for duplex or booklet printing.
 - **Cross-document references**: see [`CROSS_DOC.md`](CROSS_DOC.md).
   Intra-document refs become PDF `GoTo` annotations; cross-doc
   refs are expected to be rewritten upstream by Adeptus before they
