@@ -5554,16 +5554,16 @@ fn layout_media(tag: &Tag, x: f32, width: f32, ctx: &mut LayoutCtx<'_>) -> Vec<B
 
     // `size` keyword scales the display width relative to the space available
     // here (a column, a table cell, …): small = 50 %, medium = 75 %, large =
-    // 100 %. The default (no attribute) is 75 %. `fit_size` never upscales,
-    // so a small source image still renders at its natural size.
+    // 100 %. The default (no attribute) is 100 % (large). `fit_size` never
+    // upscales, so a small source image still renders at its natural size.
     let avail = match tag.attributes.get("size") {
         Some(Scalar::String(s)) => match s.trim() {
             "small" => width * 0.5,
             "medium" => width * 0.75,
             "large" => width,
-            _ => width * 0.75,
+            _ => width,
         },
-        _ => width * 0.75,
+        _ => width,
     };
 
     // Fetch the first candidate that resolves. A missing file fails the
